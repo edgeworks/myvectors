@@ -173,22 +173,32 @@ def ip_range(begin, end, ceiling=1024):
     return [str(ipaddress.ip_address(int(first) + i)) for i in range(size)]
 
 
-def import_nat(db, rows):
+def import_nat(db, rows, diagnostics=None):
     count, skipped = 0, 0
+    reasons = {}
+    fields = set()
+    def skip(reason):
+        nonlocal skipped
+        skipped += 1
+        reasons[reason] = reasons.get(reason, 0) + 1
     for r in rows:
-        src = val(r, 'Source_IP_Address_Start', 'source_ip_start')
-        dst = val(r, 'Target_IP_Address_Start', 'target_ip_start')
+        if not isinstance(r, dict):
+            skip('non_object_record')
+            continue
+        fields.update(str(k)[:80] for k in r if k != '__from_api')
+        src = val(r, 'Source_IP_Address_Start', 'source_ip_start', 'source_address_start', 'source_start')
+        dst = val(r, 'Target_IP_Address_Start', 'target_ip_start', 'target_address_start', 'target_start')
         if not src or not dst:
-            skipped += 1
+            skip('missing_source_or_target_ip')
             continue
         try:
             sources = ip_range(src, val(r, 'Source_IP_Address_End'))
             targets = ip_range(dst, val(r, 'Target_IP_Address_End'))
         except ValueError:
-            skipped += 1
+            skip('invalid_ip_or_range_over_1024')
             continue
         if len(targets) not in (1, len(sources)):
-            skipped += 1
+            skip('incompatible_source_target_ranges')
             continue
         rule = val(r, 'Name') or f'{src}->{dst}'
         info = {'protocol': val(r, 'Protocol'), 'source_port': val(r, 'Source_Port_Start'),
@@ -201,6 +211,9 @@ def import_nat(db, rows):
                  ref=rule + ':' + json.dumps(info, sort_keys=True),
                  note=val(r, 'Notes'), details=info)
             count += 1
+    if diagnostics is not None:
+        diagnostics['skip_reasons'] = reasons
+        diagnostics['api_field_names'] = sorted(fields)[:80]
     return count, skipped
 
 
@@ -365,9 +378,10 @@ def file_import(kind):
             return jsonify(imported=count)
         content = upload.stream.read().decode('utf-8-sig')
         rows = csv.DictReader(io.StringIO(content))
+        diagnostics = {}
         with connect() as db:
-            count, skipped = import_nat(db, rows)
-        return jsonify(imported=count, skipped=skipped)
+            count, skipped = import_nat(db, rows, diagnostics=diagnostics)
+        return jsonify(imported=count, skipped=skipped, **diagnostics)
     except (ValueError, UnicodeError, OSError, StopIteration, KeyError) as exc:
         return jsonify(error=str(exc)), 400
 
@@ -415,9 +429,10 @@ def device42_import(kind):
             for r in rows:
                 if isinstance(r, dict):
                     r['__from_api'] = True
+            diagnostics = {}
             with connect() as db:
-                count, skipped = import_nat(db, rows)
-            return jsonify(imported=count, skipped=skipped)
+                count, skipped = import_nat(db, rows, diagnostics=diagnostics)
+            return jsonify(imported=count, skipped=skipped, records_received=len(rows), **diagnostics)
         rows = d42_pages('/api/1.0/devices/all/', ('devices',), credentials)
         with connect() as db:
             count = import_devices(db, rows)
