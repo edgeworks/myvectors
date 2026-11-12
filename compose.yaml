@@ -2,7 +2,7 @@ services:
   myvectors:
     build: .
     ports:
-      - "127.0.0.1:42002:42002"
+      - "0.0.0.0:42002:42002"
     environment:
       MYVECTORS_DB: /data/myvectors.sqlite3
       DEVICE42_URL: ${DEVICE42_URL:-}
