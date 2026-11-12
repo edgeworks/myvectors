@@ -8,7 +8,17 @@ Self-hosted exposure and dependency inventory: **searchable table + interactive 
 docker compose up -d --build
 ```
 
-Open `http://127.0.0.1:42002` on the Docker host or use an SSH tunnel. The container binds only to localhost by default. **There is no built-in authentication or access control.** For team access, deploy behind an authenticated HTTPS reverse proxy and restrict access to trusted analysts. The Device42 API import and Settings URL are sensitive capabilities; do not expose directly to untrusted users. Back up the `myvectors-data` volume before upgrades or bulk deletion.
+Open `http://<server-ip>:42002` from your LAN. The published port binds to `0.0.0.0` by default. **There is no built-in authentication or access control.** Restrict port 42002 with a host/network firewall, ideally use an authenticated HTTPS reverse proxy, and allow only trusted analysts. The Device42 API import and Settings URL are sensitive capabilities; do not expose directly to untrusted users. Back up the `myvectors-data` volume before upgrades or bulk deletion.
+
+If you use a corporate proxy, configure it using a **local `.env` file** beside `compose.yaml` (already ignored by Git). `HTTP_PROXY`, `HTTPS_PROXY` and `NO_PROXY` are passed to the Docker build and to Python Requests at runtime. The default local bypass list includes `.local`, `.internal` and private IPv4 networks; add your own internal FQDNs or suffixes using `NO_PROXY`. Keep passwords and internal endpoint details out of this public repository.
+
+Example local `.env` (replace the proxy and internal suffix):
+
+```dotenv
+HTTP_PROXY=http://proxy.example.invalid:8080
+HTTPS_PROXY=http://proxy.example.invalid:8080
+NO_PROXY=localhost,127.0.0.1,::1,.local,.internal,.corp.example,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16
+```
 
 ## Workflow
 
