@@ -63,7 +63,7 @@ def test_device42_import_helpers(client,monkeypatch):
 
 def test_device42_settings_local_and_links_refresh(client, monkeypatch):
     monkeypatch.setattr(m, 'D42_URL', '')
-    assert client.get('/api/settings').json == {'device42_url': ''}
+    assert client.get('/api/settings').json == {'device42_url': '', 'device42_ip_path': m.DEFAULT_D42_IP_PATH}
     for invalid in ('http://d42.example', 'https://user:secret@d42.example',
                     'https://d42.example/admin', 'https://d42.example/?key=a',
                     'https://d42.example:bad', 'https://d42.example\n.evil.com'):
@@ -148,3 +148,63 @@ def test_device42_real_nat_api_field_names(client):
     assert len(st['edges']) == 3
     assert all(e['origin'] == 'd42_nat' for e in st['edges'])
     assert any(e['details']['target_port'] == '8443' for e in st['edges'])
+
+
+def test_ip_links_match_existing_nodes_only_and_avoid_ambiguous_vrfs(client):
+    assert client.put('/api/settings', json={'device42_url': 'https://d42.example'}).status_code == 200
+    with m.connect() as db:
+        m.node(db, 'ip', '203.0.113.10')
+        m.node(db, 'ip', '10.0.0.10')
+        m.node(db, 'ip', '10.0.0.11')
+        m.node(db, 'domain', 'web.example')
+    rows = [
+        {'ipaddress': '203.0.113.10', 'id': 101},
+        {'ip_address': '10.0.0.10', 'ip_address_id': 202},
+        {'ip': '10.0.0.10', 'id': '203', 'vrf_group': 'other'},
+        {'ipaddress': '192.0.2.100', 'id': 555}
+    ]
+    with m.connect() as db:
+        result = m.import_ip_links(db, rows)
+    assert result['linked'] == 1
+    assert result['ambiguous'] == 1
+    assert result['not_found'] == 1
+    state = client.get('/api/state').json
+    by_key = {x['key']: x for x in state['nodes']}
+    assert len(state['nodes']) == 4
+    assert by_key['203.0.113.10']['d42_url'] == 'https://d42.example/admin/rackraj/ipaddress/101/'
+    assert by_key['10.0.0.10']['d42_url'] == ''
+    assert by_key['10.0.0.10']['details']['d42_ip_status'] == 'ambiguous'
+    assert by_key['10.0.0.11']['d42_url'] == ''
+    assert client.put('/api/settings', json={'device42_url': 'https://other.example',
+        'device42_ip_path': '/custom/ip/{id}/'}).status_code == 200
+    state = client.get('/api/state').json
+    new_url = next(x['d42_url'] for x in state['nodes'] if x['key']=='203.0.113.10')
+    assert new_url == 'https://other.example/custom/ip/101/'
+    assert client.put('/api/settings', json={'device42_url': 'https://other.example',
+        'device42_ip_path': '//bad/{id}/'}).status_code == 400
+    assert client.put('/api/settings', json={'device42_url': 'https://other.example',
+        'device42_ip_path': '/bad/link'}).status_code == 400
+    with m.connect() as db:
+        result = m.import_ip_links(db, [{'ipaddress': '203.0.113.10', 'id': 101}])
+    state = client.get('/api/state').json
+    assert next(x for x in state['nodes'] if x['key']=='10.0.0.10')['d42_url'] == ''
+
+
+def test_ip_links_schema_validation_and_api_endpoint(client, monkeypatch):
+    with m.connect() as db:
+        m.node(db, 'ip', '198.51.100.14')
+    with m.connect() as db:
+        with pytest.raises(ValueError, match='schema not recognized'):
+            m.import_ip_links(db, [{'unexpected': 'value'}])
+    monkeypatch.setattr(m, 'D42_URL', 'https://d42.example')
+    calls = []
+    def fake_pages(path, names, credentials):
+        calls.append((path, names, credentials))
+        return [{'ipaddress': '198.51.100.14', 'id': 88}]
+    monkeypatch.setattr(m, 'd42_pages', fake_pages)
+    result = client.post('/api/d42/ip_links', json={'username': 'demo', 'password': 'transient'})
+    assert result.status_code == 200
+    assert result.json['linked'] == 1
+    assert calls[0][0] == '/api/1.0/ips/'
+    assert calls[0][2] == ('demo', 'transient')
+    assert 'transient' not in str(client.get('/api/state').json)
