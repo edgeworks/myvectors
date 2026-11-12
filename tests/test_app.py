@@ -114,3 +114,16 @@ def test_delete_objects_single_bulk_and_atomic(client):
     response = client.post('/api/nodes/delete', json={'ids': [a, c]})
     assert response.json['deleted'] == 2
     assert client.get('/api/state').json['nodes'] == []
+
+
+def test_nat_import_diagnostics(client):
+    diagnostics = {}
+    with m.connect() as db:
+        count, skipped = m.import_nat(db, [
+            {'id': 1, 'src_ip': '192.0.2.1', 'dst_ip': '10.0.0.1'},
+            {'Source_IP_Address_Start': '203.0.113.2', 'Target_IP_Address_Start': '10.0.0.2'}
+        ], diagnostics=diagnostics)
+    assert (count, skipped) == (1, 1)
+    assert diagnostics['skip_reasons'] == {'missing_source_or_target_ip': 1}
+    assert 'src_ip' in diagnostics['api_field_names']
+    assert '192.0.2.1' not in str(diagnostics)
