@@ -425,7 +425,7 @@ def device42_import(kind):
     except requests.exceptions.SSLError as exc:
         # Return only the TLS verifier reason, not untrusted upstream bodies or credentials.
         message = str(exc)
-        match = re.search(r'certificate verify failed:\\s*(.*?)(?:\\s*\\(_ssl\\.c:|\\)\\))', message, re.I)
+        match = re.search(r'certificate verify failed:\s*(.*?)(?:\s*\(_ssl\.c:|\)\))', message, re.I)
         reason = match.group(1).strip() if match else 'Unable to verify the Device42 TLS certificate'
         return jsonify(error=f'Device42 SSL verification failed: {reason[:350]}'), 502
     except (requests.RequestException, ValueError) as exc:
