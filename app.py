@@ -422,6 +422,12 @@ def device42_import(kind):
         with connect() as db:
             count = import_devices(db, rows)
         return jsonify(imported=count, devices_received=len(rows))
+    except requests.exceptions.SSLError as exc:
+        # Return only the TLS verifier reason, not untrusted upstream bodies or credentials.
+        message = str(exc)
+        match = re.search(r'certificate verify failed:\\s*(.*?)(?:\\s*\\(_ssl\\.c:|\\)\\))', message, re.I)
+        reason = match.group(1).strip() if match else 'Unable to verify the Device42 TLS certificate'
+        return jsonify(error=f'Device42 SSL verification failed: {reason[:350]}'), 502
     except (requests.RequestException, ValueError) as exc:
         # Avoid returning upstream response bodies (may contain sensitive data).
         return jsonify(error=f'Device42 import failed: {type(exc).__name__}: {str(exc)[:180]}'), 502
