@@ -1,45 +1,34 @@
-# MyVectors (draft MVP)
+# MyVectors (MVP)
 
-Self-hosted exposure-path inventory with **table + interactive graph**, on-demand DNS/HTTP2/NAT imports, on-demand Device42 integration, and analyst-defined proxy/backend relationships. No scheduled jobs or active scanning.
+Self-hosted exposure and dependency inventory: **searchable table + interactive graph**, on-demand DNS/NAT imports, Device42 import, and manually documented proxy/backend paths. It is deliberately vulnerability-agnostic: it does not contain a CVE/HTTP2-specific assessment column.
 
-## Quick start
+## Run
 
 ```bash
-docker compose build
-docker compose up -d
+docker compose up -d --build
 ```
 
-By default bind to `127.0.0.1:42002`. Open `http://127.0.0.1:42002` on the host or tunnel through SSH. For team access, place behind an **authenticated** internal reverse proxy with TLS (the draft app itself does not implement login). Keep backups of the `myvectors-data` volume.
-
-If you use a corporate proxy for builds, pass `HTTP_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` as Docker build arguments as appropriate for your environment. Outbound Device42 calls use the container's proxy/NO_PROXY configuration.
+Open `http://127.0.0.1:42002` on the Docker host or use an SSH tunnel. The container binds only to localhost by default. **There is no built-in authentication or access control.** For team access, deploy behind an authenticated HTTPS reverse proxy and restrict access to trusted analysts. The Device42 API import and Settings URL are sensitive capabilities; do not expose directly to untrusted users. Back up the `myvectors-data` volume before upgrades or bulk deletion.
 
 ## Workflow
 
-1. Import `domain-list.xlsx` (columns `RR name`, `Type`, `TTL`, `Value`). Supports A, AAAA, and CNAME; other record types ignored.
-2. Import `http2_results.csv` (domain, http_version, http_status, http2_enabled). **HTTP/2=YES denotes protocol exposure, not confirmed CVE exploitability.**
-3. Import NAT mapping from Device42 API (preferred) or `ip-natmap.csv` (fallback).
-4. Import device/IP associations from Device42's detailed device list API.
-5. Add manual `proxies_to`, `routes_to`, or `hosts` relationships for traffic that traverses additional hops. Use verified/suspected/unknown confidence and notes.
-6. Explore the table or click **Focus** on an object to view its nearby graph (3 hops). Table entries with Device42 device IDs include a direct link to Device42.
+1. **Imports → DNS Excel:** import `domain-list.xlsx` with columns `RR name`, `Type`, `TTL`, `Value` (A, AAAA, CNAME supported).
+2. **Settings → Device42:** enter your HTTPS Device42 appliance base URL. Saved **locally in the SQLite database**; not committed to GitHub. An optional `DEVICE42_URL` environment variable provides a fallback until a setting is saved. Clear the GUI URL to disable it if no fallback is set. Only store the URL, not credentials.
+3. **Imports → Device42 API:** enter username/password and manually request NAT and device-IP imports. Credentials are passed to the backend for that request and are not stored. Alternatively import the existing NAT CSV.
+4. **Add connection:** document reverse proxies, load balancers, application routing, and other missing relationships. Use confidence levels and notes.
+5. **Explore:** search/filter objects, inspect a selected object, and switch to Graph to trace neighboring relationships. Device42-linked devices have direct links back to Device42.
+6. **Delete:** check objects individually (or select all currently filtered rows), then click **Delete selected**, or use the **Remove** button for a single object. A confirmation reports the number of connected relationships that will also be deleted. Deletion is permanent and **re-importing source data may recreate deleted objects**; imported data and manual links are not otherwise modified by the deletion action.
 
-Device42 connector requires `DEVICE42_URL` (HTTPS only; configure using the environment variable) and prompts for Basic auth credentials **on every request**. It never stores passwords in the database or browser storage. TLS verification is enabled by default; supply your internal CA to the container rather than disabling verification in production.
+There are **no automatic background imports, active probes, CVE-specific checkers, or scheduled tasks** in this MVP. Source data and analyst assertions are separate; this tool is not evidence that a host is safe or vulnerable.
 
-### Device42 API endpoints
+### Device42 integration
 
-- `GET /api/1.0/ipnat/` for standard NAT/Map records.
-- `GET /api/1.0/devices/all/` for devices with their IP associations.
+- `GET /api/1.0/ipnat/` for NAT IP/Map data.
+- `GET /api/1.0/devices/all/` for devices and their reported IPs.
 
-Imports use bounded pagination (up to 20 pages of 1000). API response schemas vary by Device42 version; verify import counts and spot-check a few nodes/links in your environment. Importing some very large NAT IP ranges (>1024 addresses) is intentionally skipped and reported. Unsupported mappings are not silently guessed.
+Device42 versions can vary in API response structure. Import requests are limited to 20 pages of 1,000 records; NAT ranges >1024 addresses are skipped and reported. Validate import counts and NAT direction (`Source_IP_Address_Start` is assumed public/upstream). Links to imported device IDs use the configured Device42 base URL, so changing the appliance URL also refreshes links in the UI.
 
-## Limitations / safety
-
-- **Draft prototype**: test with anonymized sample data first and ensure a backup before importing real records.
-- Not a substitute for patch/version verification. HTTP/2 checks report only externally negotiated protocol.
-- Imported data and manual links are additive/upserted; stale entries are not automatically deleted.
-- No import automation, no automatic scanning, and no connection to Octosam yet.
-- No user login, audit trail, or roles in this MVP. Expose only through a protected internal gateway. File imports are limited to 16MB.
-- Device names are joined to IPs reported by D42; shared IPs and reverse proxies may need manual disambiguation.
-- NAT direction assumes `Source_IP_Address_Start` is upstream/public and `Target_IP_Address_Start` is downstream/private. Validate this for your Device42 setup.
+TLS validation is enabled for Device42 by default. Provide your internal CA to the container if needed instead of disabling verification. Make sure your container's `NO_PROXY` includes the internal Device42 host where a proxy is configured.
 
 ## Tests
 
@@ -47,3 +36,5 @@ Imports use bounded pagination (up to 20 pages of 1000). API response schemas va
 python -m pip install -r requirements.txt pytest
 pytest -q
 ```
+
+Existing SQLite volumes migrate automatically: an additional `settings` table is created. Previously imported HTTP/2 observations, if any, remain in old domain metadata but there is no specialized HTTP/2 importer or column in the new GUI. Export/backup the database if these historic observations matter. A deletion removes associated edges, not other objects.
