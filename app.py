@@ -16,7 +16,7 @@ from openpyxl import load_workbook
 
 BASE = Path(__file__).resolve().parent
 DB_PATH = os.environ.get('MYVECTORS_DB', str(BASE / 'data' / 'myvectors.sqlite3'))
-D42_URL = os.environ.get('DEVICE42_URL', '').rstrip('/')
+D42_URL = os.environ.get('DEVICE42_URL', '').rstrip('/')  # optional fallback; GUI value lives in SQLite
 D42_VERIFY_TLS = os.environ.get('D42_VERIFY_TLS', 'true').lower() == 'true'
 KINDS = {'domain', 'ip', 'device', 'service'}
 RELATIONS = {'resolves_to', 'nat_to', 'belongs_to', 'proxies_to', 'routes_to', 'hosts', 'connects_to'}
@@ -49,10 +49,44 @@ def connect():
         note TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '{}',
         updated TEXT NOT NULL,
         UNIQUE(src, dst, relation, origin, ref));
+      CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS edges_src ON edges(src);
       CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
     ''')
     return db
+
+
+def validate_d42_url(value):
+    if not isinstance(value, str):
+        raise ValueError('Device42 URL must be a string')
+    value = value.strip().rstrip('/')
+    if value and any(ord(ch) < 33 for ch in value):
+        raise ValueError('Device42 URL contains invalid whitespace or control characters')
+    if not value:
+        return ''
+    if len(value) > 512:
+        raise ValueError('Device42 URL is too long')
+    parsed = urlparse(value)
+    if (parsed.scheme != 'https' or not parsed.hostname or parsed.username or
+            parsed.password or parsed.path or parsed.query or parsed.fragment):
+        raise ValueError('Enter an HTTPS Device42 base URL without credentials, path, or query')
+    try:
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError('Invalid Device42 port') from exc
+    return value
+
+
+def configured_d42_url(db=None):
+    if db is None:
+        with connect() as conn:
+            return configured_d42_url(conn)
+    item = db.execute('SELECT value FROM settings WHERE key=?', ('device42_url',)).fetchone()
+    return item['value'] if item else D42_URL
+
+
+def device42_link(base, device_id):
+    return base + '/admin/rackraj/device/' + quote(str(device_id)) + '/' if base and str(device_id).isdigit() else ''
 
 
 def normalize(kind, key):
@@ -128,20 +162,6 @@ def import_dns(db, rows):
     return count
 
 
-def import_http2(db, rows):
-    count = 0
-    for r in rows:
-        domain = val(r, 'domain')
-        enabled = val(r, 'http2_enabled').upper()
-        if not domain or enabled not in ('YES', 'NO'):
-            continue
-        node(db, 'domain', domain, details={'http2_enabled': enabled,
-             'http_version': val(r, 'http_version'), 'http_status': val(r, 'http_status'),
-             'http2_checked_at': now()})
-        count += 1
-    return count
-
-
 def ip_range(begin, end, ceiling=1024):
     first = ipaddress.ip_address(begin)
     last = ipaddress.ip_address(end or begin)
@@ -200,9 +220,10 @@ def extract_rows(payload, names):
 
 
 def d42_get(path, credentials, params):
-    if not D42_URL or urlparse(D42_URL).scheme != 'https':
-        raise ValueError('Set DEVICE42_URL to the HTTPS URL of your appliance')
-    response = requests.get(D42_URL + path, params=params, auth=credentials,
+    base = validate_d42_url(configured_d42_url())
+    if not base:
+        raise ValueError('Set the Device42 URL under Settings first')
+    response = requests.get(base + path, params=params, auth=credentials,
                             verify=D42_VERIFY_TLS, timeout=25,
                             headers={'Accept': 'application/json'})
     response.raise_for_status()
@@ -246,7 +267,7 @@ def import_devices(db, rows):
         if not name:
             continue
         device_id = val(r, 'device_id', 'id')
-        link = (D42_URL + '/admin/rackraj/device/' + quote(device_id) + '/') if device_id.isdigit() else ''
+        link = device42_link(configured_d42_url(db), device_id)
         device = node(db, 'device', name, label=name,
                       details={'d42_id': device_id, 'os': val(r, 'os'),
                                'type': val(r, 'type')}, d42_url=link)
@@ -261,8 +282,12 @@ def response_state():
     with connect() as db:
         nodes = [dict(x) for x in db.execute('SELECT * FROM nodes ORDER BY kind,label')]
         edges = [dict(x) for x in db.execute('SELECT * FROM edges ORDER BY id')]
+        base = configured_d42_url(db)
     for x in nodes + edges:
         x['details'] = json.loads(x['details'])
+    for x in nodes:
+        if x['kind'] == 'device' and x['details'].get('d42_id'):
+            x['d42_url'] = device42_link(base, x['details']['d42_id'])
     return {'nodes': nodes, 'edges': edges}
 
 
@@ -276,9 +301,51 @@ def state():
     return jsonify(response_state())
 
 
+@app.get('/api/settings')
+def get_settings():
+    return jsonify(device42_url=configured_d42_url())
+
+
+@app.put('/api/settings')
+def save_settings():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error='Expected JSON object'), 400
+    try:
+        value = validate_d42_url(data.get('device42_url'))
+        with connect() as db:
+            db.execute('INSERT INTO settings(key,value) VALUES(?,?) '
+                       'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                       ('device42_url', value))
+        return jsonify(device42_url=value)
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 400
+
+
+@app.post('/api/nodes/delete')
+def delete_nodes():
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return jsonify(error='Expected JSON object'), 400
+    ids = data.get('ids')
+    if (not isinstance(ids, list) or not ids or len(ids) > 10000 or
+            any(type(x) is not int or x <= 0 for x in ids)):
+        return jsonify(error='Provide 1-10000 valid integer IDs'), 400
+    ids = list(set(ids))
+    with connect() as db:
+        existing = {row['id'] for row in db.execute('SELECT id FROM nodes')}
+        if not set(ids).issubset(existing):
+            return jsonify(error='One or more objects no longer exist; refresh the list'), 404
+        before = db.execute('SELECT COUNT(*) FROM edges').fetchone()[0]
+        db.executemany('DELETE FROM edges WHERE src=? OR dst=?', [(i, i) for i in ids])
+        after = db.execute('SELECT COUNT(*) FROM edges').fetchone()[0]
+        db.executemany('DELETE FROM nodes WHERE id=?', [(i,) for i in ids])
+    return jsonify(deleted=len(ids), connections_deleted=before-after)
+
+
 @app.post('/api/import/<kind>')
 def file_import(kind):
-    if kind not in ('dns', 'http2', 'nat'):
+    if kind not in ('dns', 'nat'):
         return jsonify(error='Invalid import type'), 400
     upload = request.files.get('file')
     if not upload:
@@ -298,10 +365,6 @@ def file_import(kind):
             return jsonify(imported=count)
         content = upload.stream.read().decode('utf-8-sig')
         rows = csv.DictReader(io.StringIO(content))
-        if kind == 'http2':
-            with connect() as db:
-                count = import_http2(db, rows)
-            return jsonify(imported=count)
         with connect() as db:
             count, skipped = import_nat(db, rows)
         return jsonify(imported=count, skipped=skipped)
