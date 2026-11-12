@@ -127,3 +127,24 @@ def test_nat_import_diagnostics(client):
     assert diagnostics['skip_reasons'] == {'missing_source_or_target_ip': 1}
     assert 'src_ip' in diagnostics['api_field_names']
     assert '192.0.2.1' not in str(diagnostics)
+
+
+def test_device42_real_nat_api_field_names(client):
+    diagnostics = {}
+    rows = [
+        {'id': 7, 'name': 'web-443', 'ip_address_from': '203.0.113.10',
+         'ip_address_to': '10.0.0.10', 'source_port_start': 443,
+         'target_port_start': 8443, '__from_api': True},
+        {'id': 8, 'name': 'range', 'ip_address_from': '198.51.100.20',
+         'ip_address_from_end': '198.51.100.21',
+         'ip_address_to': '10.0.0.20', 'ip_address_to_end': '10.0.0.21',
+         '__from_api': True}
+    ]
+    with m.connect() as db:
+        count, skipped = m.import_nat(db, rows, diagnostics=diagnostics)
+    assert (count, skipped) == (3, 0)
+    assert diagnostics['skip_reasons'] == {}
+    st = client.get('/api/state').json
+    assert len(st['edges']) == 3
+    assert all(e['origin'] == 'd42_nat' for e in st['edges'])
+    assert any(e['details']['target_port'] == '8443' for e in st['edges'])
