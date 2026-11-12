@@ -18,6 +18,7 @@ BASE = Path(__file__).resolve().parent
 DB_PATH = os.environ.get('MYVECTORS_DB', str(BASE / 'data' / 'myvectors.sqlite3'))
 D42_URL = os.environ.get('DEVICE42_URL', '').rstrip('/')  # optional fallback; GUI value lives in SQLite
 D42_VERIFY_TLS = os.environ.get('D42_VERIFY_TLS', 'true').lower() == 'true'
+DEFAULT_D42_IP_PATH = '/admin/rackraj/ipaddress/{id}/'
 KINDS = {'domain', 'ip', 'device', 'service'}
 RELATIONS = {'resolves_to', 'nat_to', 'belongs_to', 'proxies_to', 'routes_to', 'hosts', 'connects_to'}
 
@@ -83,6 +84,30 @@ def configured_d42_url(db=None):
             return configured_d42_url(conn)
     item = db.execute('SELECT value FROM settings WHERE key=?', ('device42_url',)).fetchone()
     return item['value'] if item else D42_URL
+
+
+def validate_d42_ip_path(value):
+    if not isinstance(value, str) or not value:
+        raise ValueError('Device42 IP detail path is required')
+    if (len(value) > 255 or not value.startswith('/') or value.startswith('//') or
+            value.count('{id}') != 1 or not re.fullmatch(r'[A-Za-z0-9/_{}.-]+', value) or
+            '..' in value):
+        raise ValueError('Enter a relative path such as /admin/rackraj/ipaddress/{id}/')
+    return value
+
+
+def configured_d42_ip_path(db=None):
+    if db is None:
+        with connect() as conn:
+            return configured_d42_ip_path(conn)
+    item = db.execute('SELECT value FROM settings WHERE key=?', ('device42_ip_path',)).fetchone()
+    return item['value'] if item else DEFAULT_D42_IP_PATH
+
+
+def device42_ip_link(base, ip_id, path):
+    if base and str(ip_id).isdigit():
+        return base + validate_d42_ip_path(path).replace('{id}', quote(str(ip_id)))
+    return ''
 
 
 def device42_link(base, device_id):
@@ -291,16 +316,64 @@ def import_devices(db, rows):
     return count
 
 
+def import_ip_links(db, rows):
+    """Enrich existing IP nodes from D42's IP inventory. Never create false mappings."""
+    local = {r['key']: r for r in db.execute("SELECT id,key,details FROM nodes WHERE kind='ip'")}
+    candidates = {}
+    fields = set()
+    readable = 0
+    for record in rows:
+        if not isinstance(record, dict):
+            continue
+        fields.update(str(key)[:70] for key in record)
+        address = val(record, 'ip', 'ipaddress', 'ip_address', 'address', 'ip_address_value')
+        ip_id = val(record, 'id', 'ip_id', 'ipaddress_id', 'ip_address_id', 'ipaddress_pk')
+        if not address or not ip_id.isdecimal():
+            continue
+        try:
+            key = normalize('ip', address)
+        except ValueError:
+            continue
+        readable += 1
+        if key in local:
+            candidates.setdefault(key, set()).add(ip_id)
+    if rows and not readable:
+        raise ValueError('IP API schema not recognized; available field names: ' +
+                         ', '.join(sorted(fields)[:20]))
+    matched = ambiguous = 0
+    for key, row in local.items():
+        ids = candidates.get(key, set())
+        details = json.loads(row['details'])
+        details.pop('d42_ip_id', None)
+        details.pop('d42_ip_status', None)
+        details.pop('d42_ip_match_count', None)
+        if len(ids) == 1:
+            details['d42_ip_id'] = next(iter(ids))
+            matched += 1
+        elif len(ids) > 1:
+            details['d42_ip_status'] = 'ambiguous'
+            details['d42_ip_match_count'] = len(ids)
+            ambiguous += 1
+        db.execute('UPDATE nodes SET details=?,updated=? WHERE id=?',
+                   (json.dumps(details), now(), row['id']))
+    return {'linked': matched, 'ambiguous': ambiguous, 'not_found': len(local)-matched-ambiguous,
+            'ips_in_myvectors': len(local), 'records_received': len(rows),
+            'ip_api_field_names': sorted(fields)[:40]}
+
+
 def response_state():
     with connect() as db:
         nodes = [dict(x) for x in db.execute('SELECT * FROM nodes ORDER BY kind,label')]
         edges = [dict(x) for x in db.execute('SELECT * FROM edges ORDER BY id')]
         base = configured_d42_url(db)
+        ip_path = configured_d42_ip_path(db)
     for x in nodes + edges:
         x['details'] = json.loads(x['details'])
     for x in nodes:
         if x['kind'] == 'device' and x['details'].get('d42_id'):
             x['d42_url'] = device42_link(base, x['details']['d42_id'])
+        if x['kind'] == 'ip':
+            x['d42_url'] = device42_ip_link(base, x['details'].get('d42_ip_id'), ip_path)
     return {'nodes': nodes, 'edges': edges}
 
 
@@ -316,7 +389,7 @@ def state():
 
 @app.get('/api/settings')
 def get_settings():
-    return jsonify(device42_url=configured_d42_url())
+    return jsonify(device42_url=configured_d42_url(), device42_ip_path=configured_d42_ip_path())
 
 
 @app.put('/api/settings')
@@ -326,11 +399,15 @@ def save_settings():
         return jsonify(error='Expected JSON object'), 400
     try:
         value = validate_d42_url(data.get('device42_url'))
+        path = validate_d42_ip_path(data.get('device42_ip_path', configured_d42_ip_path()))
         with connect() as db:
             db.execute('INSERT INTO settings(key,value) VALUES(?,?) '
                        'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                        ('device42_url', value))
-        return jsonify(device42_url=value)
+            db.execute('INSERT INTO settings(key,value) VALUES(?,?) '
+                       'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                       ('device42_ip_path', path))
+        return jsonify(device42_url=value, device42_ip_path=path)
     except ValueError as exc:
         return jsonify(error=str(exc)), 400
 
@@ -416,7 +493,7 @@ def create_connection():
 
 @app.post('/api/d42/<kind>')
 def device42_import(kind):
-    if kind not in ('nat', 'devices'):
+    if kind not in ('nat', 'devices', 'ip_links'):
         return jsonify(error='Invalid Device42 import type'), 400
     data = request.get_json(silent=True) or {}
     username, password = data.get('username', ''), data.get('password', '')
@@ -433,6 +510,11 @@ def device42_import(kind):
             with connect() as db:
                 count, skipped = import_nat(db, rows, diagnostics=diagnostics)
             return jsonify(imported=count, skipped=skipped, records_received=len(rows), **diagnostics)
+        if kind == 'ip_links':
+            rows = d42_pages('/api/1.0/ips/', ('ips', 'ip_addresses', 'ipaddresses'), credentials)
+            with connect() as db:
+                outcome = import_ip_links(db, rows)
+            return jsonify(**outcome)
         rows = d42_pages('/api/1.0/devices/all/', ('devices',), credentials)
         with connect() as db:
             count = import_devices(db, rows)
