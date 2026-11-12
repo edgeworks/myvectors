@@ -186,14 +186,14 @@ def import_nat(db, rows, diagnostics=None):
             skip('non_object_record')
             continue
         fields.update(str(k)[:80] for k in r if k != '__from_api')
-        src = val(r, 'Source_IP_Address_Start', 'source_ip_start', 'source_address_start', 'source_start')
-        dst = val(r, 'Target_IP_Address_Start', 'target_ip_start', 'target_address_start', 'target_start')
+        src = val(r, 'Source_IP_Address_Start', 'source_ip_start', 'source_address_start', 'source_start', 'ip_address_from')
+        dst = val(r, 'Target_IP_Address_Start', 'target_ip_start', 'target_address_start', 'target_start', 'ip_address_to')
         if not src or not dst:
             skip('missing_source_or_target_ip')
             continue
         try:
-            sources = ip_range(src, val(r, 'Source_IP_Address_End'))
-            targets = ip_range(dst, val(r, 'Target_IP_Address_End'))
+            sources = ip_range(src, val(r, 'Source_IP_Address_End', 'ip_address_from_end'))
+            targets = ip_range(dst, val(r, 'Target_IP_Address_End', 'ip_address_to_end'))
         except ValueError:
             skip('invalid_ip_or_range_over_1024')
             continue
