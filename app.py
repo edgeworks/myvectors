@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+from uuid import uuid4
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote, urlparse
@@ -51,6 +52,13 @@ def connect():
         updated TEXT NOT NULL,
         UNIQUE(src, dst, relation, origin, ref));
       CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS d42_ip_runs (
+        run_id TEXT PRIMARY KEY, next_offset INTEGER NOT NULL DEFAULT 0,
+        created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+      CREATE TABLE IF NOT EXISTS d42_ip_candidates (
+        run_id TEXT NOT NULL, ip TEXT NOT NULL, record_id TEXT NOT NULL,
+        PRIMARY KEY(run_id, ip, record_id));
+      CREATE INDEX IF NOT EXISTS d42_ip_candidates_run ON d42_ip_candidates(run_id);
       CREATE INDEX IF NOT EXISTS edges_src ON edges(src);
       CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
     ''')
@@ -518,9 +526,151 @@ def create_connection():
         return jsonify(error=str(exc)), 400
 
 
+# Keep individual Device42 calls small. The default 1000-record IP API response
+# has been observed to exceed Gunicorn's worker timeout on some appliances.
+D42_PAGE_SIZES = {'devices': 50, 'ip_links': 100}
+D42_MAX_OFFSET = 100000
+
+
+def d42_page_count(payload):
+    """Optional total count, where provided by Device42."""
+    if isinstance(payload, dict):
+        for obj in (payload, *[v for v in payload.values() if isinstance(v, dict)]):
+            for key in ('total_count', 'total', 'count'):
+                value = obj.get(key)
+                if value is not None and str(value).isdigit():
+                    return int(value)
+    return None
+
+
+def stage_ip_records(db, run_id, offset, rows):
+    """Stage candidate IDs in SQLite; only commit links after all pages arrive."""
+    db.execute("DELETE FROM d42_ip_candidates WHERE run_id IN "
+               "(SELECT run_id FROM d42_ip_runs WHERE created < datetime('now','-1 day'))")
+    db.execute("DELETE FROM d42_ip_runs WHERE created < datetime('now','-1 day')")
+    if offset == 0:
+        run_id = uuid4().hex
+        db.execute('INSERT INTO d42_ip_runs(run_id,next_offset) VALUES(?,0)', (run_id,))
+    else:
+        if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
+            raise ValueError('Invalid Device42 import session; restart the import')
+        item = db.execute('SELECT next_offset FROM d42_ip_runs WHERE run_id=?', (run_id,)).fetchone()
+        if not item or item['next_offset'] != offset:
+            raise ValueError('Device42 import session expired or pages are out of order; restart')
+    local_ips = {r['key'] for r in db.execute("SELECT key FROM nodes WHERE kind='ip'")}
+    readable = 0
+    fields = set()
+    for record in rows:
+        if not isinstance(record, dict):
+            continue
+        fields.update(str(k)[:65] for k in record.keys())
+        address = val(record, 'ip', 'ipaddress', 'ip_address', 'address', 'ip_address_value')
+        record_id = val(record, 'id', 'ip_id', 'ipaddress_id', 'ip_address_id', 'ipaddress_pk')
+        if not address or not record_id.isdecimal():
+            continue
+        try:
+            key = normalize('ip', address)
+        except ValueError:
+            continue
+        readable += 1
+        if key in local_ips:
+            db.execute('INSERT OR IGNORE INTO d42_ip_candidates(run_id,ip,record_id) VALUES(?,?,?)',
+                       (run_id, key, record_id))
+    if rows and readable == 0:
+        raise ValueError('Device42 IP field names not recognized: ' + ', '.join(sorted(fields)[:25]))
+    db.execute('UPDATE d42_ip_runs SET next_offset=? WHERE run_id=?',
+               (offset + len(rows), run_id))
+    return run_id, readable
+
+
+def finish_ip_run(db, run_id):
+    """Apply unique matches; clear stale links; never guess across overlapping VRFs."""
+    mapping = {}
+    for row in db.execute('SELECT ip,record_id FROM d42_ip_candidates WHERE run_id=?', (run_id,)):
+        mapping.setdefault(row['ip'], set()).add(row['record_id'])
+    matched = ambiguous = 0
+    items = db.execute("SELECT id,key,details FROM nodes WHERE kind='ip'").fetchall()
+    for row in items:
+        details = json.loads(row['details'])
+        for key in ('d42_ip_id','d42_ip_status','d42_ip_match_count'):
+            details.pop(key, None)
+        ids = mapping.get(row['key'], set())
+        if len(ids) == 1:
+            details['d42_ip_id'] = next(iter(ids))
+            matched += 1
+        elif len(ids) > 1:
+            details['d42_ip_status'] = 'ambiguous'
+            details['d42_ip_match_count'] = len(ids)
+            ambiguous += 1
+        db.execute('UPDATE nodes SET details=?,updated=? WHERE id=?',
+                   (json.dumps(details), now(), row['id']))
+    db.execute('DELETE FROM d42_ip_candidates WHERE run_id=?', (run_id,))
+    db.execute('DELETE FROM d42_ip_runs WHERE run_id=?', (run_id,))
+    return {'linked': matched, 'ambiguous': ambiguous,
+            'not_found': len(items)-matched-ambiguous, 'ips_in_myvectors': len(items)}
+
+
+@app.post('/api/d42/<kind>/page')
+def device42_import_page(kind):
+    if kind not in D42_PAGE_SIZES:
+        return jsonify(error='Invalid paged import type'), 400
+    data = request.get_json(silent=True) or {}
+    username, password = data.get('username', ''), data.get('password', '')
+    offset = data.get('offset', 0)
+    if not isinstance(username, str) or not isinstance(password, str) or not username or not password:
+        return jsonify(error='Device42 credentials are required'), 400
+    if type(offset) is not int or offset < 0 or offset > D42_MAX_OFFSET:
+        return jsonify(error='Invalid page offset'), 400
+    limit = D42_PAGE_SIZES[kind]
+    path = '/api/1.0/ips/' if kind == 'ip_links' else '/api/1.0/devices/all/'
+    names = ('ips', 'ip_addresses', 'ipaddresses') if kind == 'ip_links' else ('devices',)
+    try:
+        if kind == 'ip_links' and offset:
+            # Check the checkpoint before making another potentially slow HTTP call.
+            run_id = data.get('run_id')
+            with connect() as db:
+                existing = db.execute('SELECT next_offset FROM d42_ip_runs WHERE run_id=?',
+                                      (str(run_id),)).fetchone()
+            if not existing or existing['next_offset'] != offset:
+                return jsonify(error='IP import session expired or offset mismatch; restart'), 409
+        payload = d42_get(path, (username, password), {'limit': limit, 'offset': offset})
+        batch = extract_rows(payload, names)
+        if len(batch) > limit:
+            raise ValueError('Device42 ignored the requested page size; '
+                             'check Enforce API GET Limits in Device42 Global Settings')
+        total = d42_page_count(payload)
+        next_offset = offset + len(batch)
+        if next_offset > D42_MAX_OFFSET:
+            raise ValueError('Device42 import reached the maximum 100,000 records')
+        done = len(batch) < limit or (total is not None and next_offset >= total)
+        result = {'received': len(batch), 'next_offset': next_offset,
+                  'done': done, 'total_count': total}
+        if kind == 'devices':
+            with connect() as db:
+                result['imported'] = import_devices(db, batch)
+        else:
+            with connect() as db:
+                run_id, readable = stage_ip_records(db, data.get('run_id'), offset, batch)
+                result['run_id'] = run_id
+                result['readable'] = readable
+                if done:
+                    result.update(finish_ip_run(db, run_id))
+        return jsonify(result)
+    except requests.exceptions.SSLError as exc:
+        return jsonify(error='Device42 TLS validation failed. Check CA chain and proxy: '
+                       + type(exc).__name__), 502
+    except requests.Timeout:
+        return jsonify(error=f'Device42 {path} did not respond to this {limit}-record page '
+                       'within the request timeout. Check API performance or reduce page size.'), 504
+    except requests.RequestException as exc:
+        return jsonify(error=f'Device42 request failed: {type(exc).__name__}'), 502
+    except ValueError as exc:
+        return jsonify(error=str(exc)), 502
+
+
 @app.post('/api/d42/<kind>')
 def device42_import(kind):
-    if kind not in ('nat', 'devices', 'ip_links'):
+    if kind != 'nat':
         return jsonify(error='Invalid Device42 import type'), 400
     data = request.get_json(silent=True) or {}
     username, password = data.get('username', ''), data.get('password', '')
@@ -537,15 +687,6 @@ def device42_import(kind):
             with connect() as db:
                 count, skipped = import_nat(db, rows, diagnostics=diagnostics)
             return jsonify(imported=count, skipped=skipped, records_received=len(rows), **diagnostics)
-        if kind == 'ip_links':
-            rows = d42_pages('/api/1.0/ips/', ('ips', 'ip_addresses', 'ipaddresses'), credentials)
-            with connect() as db:
-                outcome = import_ip_links(db, rows)
-            return jsonify(**outcome)
-        rows = d42_pages('/api/1.0/devices/all/', ('devices',), credentials)
-        with connect() as db:
-            count = import_devices(db, rows)
-        return jsonify(imported=count, devices_received=len(rows))
     except requests.exceptions.SSLError as exc:
         # Return only the TLS verifier reason, not untrusted upstream bodies or credentials.
         message = str(exc)
