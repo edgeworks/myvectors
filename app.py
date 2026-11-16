@@ -710,6 +710,16 @@ def finish_ip_run(db, run_id):
                     edge(db, item['id'], device, 'belongs_to', 'd42_ip_assoc',
                          ref=next(iter(ip_ids)) + ':' + candidate['id'],
                          note='Device42 IP association; not a verified Octosam identity')
+    if not unchanged:
+        # Remove stale device objects created by this integration only when
+        # nothing else in the map references them.
+        old = db.execute("SELECT id,details FROM nodes WHERE kind='device' AND key LIKE 'd42:%'").fetchall()
+        for item in old:
+            if json.loads(item['details']).get('source') != 'd42_ip_assoc':
+                continue
+            if not db.execute('SELECT 1 FROM edges WHERE src=? OR dst=? LIMIT 1',
+                              (item['id'], item['id'])).fetchone():
+                db.execute('DELETE FROM nodes WHERE id=?', (item['id'],))
     for table in ('d42_ip_device_candidates', 'd42_ip_candidates',
                   'd42_ip_targets', 'd42_ip_runs'):
         db.execute('DELETE FROM ' + table + ' WHERE run_id=?', (run_id,))
