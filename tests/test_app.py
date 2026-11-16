@@ -198,15 +198,18 @@ def test_ip_links_schema_validation_and_api_endpoint(client, monkeypatch):
             m.import_ip_links(db, [{'unexpected': 'value'}])
     monkeypatch.setattr(m, 'D42_URL', 'https://d42.example')
     calls = []
-    def fake_pages(path, names, credentials):
-        calls.append((path, names, credentials))
-        return [{'ipaddress': '198.51.100.14', 'id': 88}]
-    monkeypatch.setattr(m, 'd42_pages', fake_pages)
-    result = client.post('/api/d42/ip_links', json={'username': 'demo', 'password': 'transient'})
+    def fake_get(path, credentials, params):
+        calls.append((path, credentials, params))
+        return {'ips': [{'ipaddress': '198.51.100.14', 'id': 88}], 'total_count': 1}
+    monkeypatch.setattr(m, 'd42_get', fake_get)
+    result = client.post('/api/d42/ip_links/page', json={'username': 'demo',
+                         'password': 'transient', 'offset': 0})
     assert result.status_code == 200
     assert result.json['linked'] == 1
+    assert result.json['done'] is True
     assert calls[0][0] == '/api/1.0/ips/'
-    assert calls[0][2] == ('demo', 'transient')
+    assert calls[0][1] == ('demo', 'transient')
+    assert calls[0][2] == {'limit': 100, 'offset': 0}
     assert 'transient' not in str(client.get('/api/state').json)
 
 
@@ -239,3 +242,83 @@ def test_device42_response_diagnostics(client, monkeypatch):
     monkeypatch.setattr(m.requests, 'get', lambda *args, **kwargs:
                         Response(200, 'application/json', {'ips': [{'id': 1}]}))
     assert m.d42_get('/api/1.0/ips/', ('user', 'secret'), {}) == {'ips': [{'id': 1}]}
+
+
+
+def test_ip_page_import_stages_until_complete(client, monkeypatch):
+    assert client.put('/api/settings', json={'device42_url': 'https://d42.example'}).status_code == 200
+    monkeypatch.setitem(m.D42_PAGE_SIZES, 'ip_links', 2)
+    with m.connect() as db:
+        m.node(db, 'ip', '10.1.1.1', details={'d42_ip_id': 'old'})
+        m.node(db, 'ip', '10.1.1.2')
+        m.node(db, 'ip', '10.1.1.3')
+    calls = []
+    def fake_get(path, credentials, params):
+        calls.append(params)
+        records = [
+            {'ipaddress': '10.1.1.1', 'id': 1},
+            {'ipaddress': '10.1.1.2', 'id': 2},
+            {'ipaddress': '10.1.1.2', 'id': 3},
+        ]
+        return {'ips': records[params['offset']:params['offset']+params['limit']],
+                'total_count': len(records)}
+    monkeypatch.setattr(m, 'd42_get', fake_get)
+    args = {'username': 'user', 'password': 'secret'}
+    first = client.post('/api/d42/ip_links/page', json={**args, 'offset': 0})
+    assert first.status_code == 200
+    assert first.json['received'] == 2
+    assert first.json['done'] is False
+    old_id = next(n['details']['d42_ip_id'] for n in client.get('/api/state').json['nodes']
+                  if n['key'] == '10.1.1.1')
+    assert old_id == 'old'  # No partial updates before the last page.
+    second = client.post('/api/d42/ip_links/page',
+                         json={**args, 'offset': 2, 'run_id': first.json['run_id']})
+    assert second.status_code == 200
+    assert second.json['done'] is True
+    assert second.json['linked'] == 1
+    assert second.json['ambiguous'] == 1
+    assert second.json['not_found'] == 1
+    with m.connect() as db:
+        assert db.execute('SELECT COUNT(*) FROM d42_ip_runs').fetchone()[0] == 0
+        assert db.execute('SELECT COUNT(*) FROM d42_ip_candidates').fetchone()[0] == 0
+    nodes = {n['key']: n for n in client.get('/api/state').json['nodes']}
+    assert nodes['10.1.1.1']['details']['d42_ip_id'] == '1'
+    assert nodes['10.1.1.2']['details']['d42_ip_status'] == 'ambiguous'
+    assert not nodes['10.1.1.3']['d42_url']
+    assert calls == [{'limit': 2, 'offset': 0}, {'limit': 2, 'offset': 2}]
+
+
+def test_devices_import_one_page_per_request(client, monkeypatch):
+    monkeypatch.setitem(m.D42_PAGE_SIZES, 'devices', 2)
+    def fake_get(path, credentials, params):
+        records = [
+            {'name': 'server-a', 'device_id': 1, 'ip_addresses': [{'ip': '10.1.2.1'}]},
+            {'name': 'server-b', 'device_id': 2, 'ip_addresses': [{'ip': '10.1.2.2'}]},
+            {'name': 'server-c', 'device_id': 3, 'ip_addresses': [{'ip': '10.1.2.3'}]},
+        ]
+        return {'devices': records[params['offset']:params['offset']+params['limit']],
+                'total_count': len(records)}
+    monkeypatch.setattr(m, 'd42_get', fake_get)
+    creds = {'username': 'user', 'password': 'secret'}
+    first = client.post('/api/d42/devices/page', json=creds)
+    assert first.status_code == 200
+    assert first.json['received'] == 2
+    assert first.json['done'] is False
+    second = client.post('/api/d42/devices/page', json={**creds, 'offset': 2})
+    assert second.status_code == 200
+    assert second.json['done'] is True
+    assert second.json['imported'] == 1
+    state = client.get('/api/state').json
+    assert len([n for n in state['nodes'] if n['kind'] == 'device']) == 3
+    assert len(state['edges']) == 3
+
+
+def test_page_import_reports_device42_timeout(client, monkeypatch):
+    def failed_get(*args, **kwargs):
+        raise m.requests.Timeout('Device42 timed out')
+    monkeypatch.setattr(m, 'd42_get', failed_get)
+    r = client.post('/api/d42/ip_links/page',
+                    json={'username': 'u', 'password': 'p'})
+    assert r.status_code == 504
+    assert 'did not respond' in r.json['error']
+    assert 'Device42 timed out' not in r.json['error']
