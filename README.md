@@ -43,6 +43,17 @@ Device42 versions can vary in API response structure. The legacy NAT import is l
 
 TLS validation is enabled for Device42 by default. Provide your internal CA to the container if needed instead of disabling verification. Make sure your container's `NO_PROXY` includes the internal Device42 host where a proxy is configured.
 
+## Device42 IP → device mappings
+
+**Link NAT IPs in Device42** now also imports all device associations for each matching NAT IP using the read-only DOQL views `view_ipaddress_v1`, `view_ipaddress_device_v2`, and `view_device_v1`. It does not crawl the full inventory.
+
+- **Explore → Table → Mapped device** shows the Device42 name for one association, or a review indicator for multiple devices or overlapping VRF matches. The **Details** panel shows the full list, Device42 links, and Device42's reported device type.
+- Statuses: `single`, `multiple`, `cluster` (only if the Device42 *type* explicitly contains 'cluster'), `unassigned` (IP exists with no associated device), `ambiguous_ip` (overlapping Device42 IP entries), and `ip_not_found`.
+- Unambiguous IP-to-device associations also appear as `belongs_to` graph links sourced from `d42_ip_assoc`. Multiple device candidates create multiple associations. For overlapping IP records, possible device names appear in Details but no misleading graph association is created.
+- Device nodes use stable Device42 IDs, and previously imported manual relations remain untouched. After a successful refresh, orphaned association-only device nodes are pruned. Incomplete imports do not change the live mapping.
+- **These are Device42 candidates, not authoritative Octosam host identities.** A device record may represent a cluster, VIP, appliance, or other logical object even when its type is not `cluster`; treat it as unresolved until verified. Octosam mapping and manual overrides are future steps.
+- Your appliance must support `view_ipaddress_device_v2` and the `type` field in `view_device_v1`. If the schema differs, the DOQL request fails explicitly rather than silently misrepresenting candidates.
+
 ## Troubleshooting Device42 imports
 
 **Link NAT IPs in Device42** uses 25 NAT IPs per DOQL query, not the full IP inventory. The source and target IPs are deduplicated and snapshotted at the start; progress shows the number of NAT addresses checked. Only NAT IP records are linked. Matching IDs are staged in SQLite and applied after the full run; cancellation preserves existing links. If no matching records are returned, existing links are left unchanged. Device42 IPs with multiple matches (e.g. overlapping VRFs) remain ambiguous. **Import ALL devices & IPs** continues to use the separate paged device inventory API (50 devices per page); it may take longer and is optional. Both imports remain on-demand, with a Stop button between requests. In-progress staging older than one day is cleaned on later imports. DOQL responses and exact field names can vary by Device42 version and have not yet been verified on your appliance.
