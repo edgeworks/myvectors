@@ -243,17 +243,23 @@ def import_nat(db, rows, diagnostics=None):
 
 
 def extract_rows(payload, names):
+    # Device42 versions differ: some return {"Devices": [...]}, others
+    # {"Devices": {"devices": [...], "total_count": ...}}.
     if isinstance(payload, list):
         return payload
     if isinstance(payload, dict):
         normalized = canon(payload)
-        for name in names:
+        keys = tuple(names) + ('results', 'data', 'items')
+        for name in keys:
             found = normalized.get(re.sub(r'[^a-z0-9]', '', name.lower()))
             if isinstance(found, list):
                 return found
-        for k in ('results', 'data', 'items'):
-            if isinstance(payload.get(k), list):
-                return payload[k]
+            if isinstance(found, dict):
+                nested = canon(found)
+                for nested_name in keys:
+                    rows = nested.get(re.sub(r'[^a-z0-9]', '', nested_name.lower()))
+                    if isinstance(rows, list):
+                        return rows
     raise ValueError('Unrecognized Device42 response shape; no changes were imported')
 
 
@@ -262,10 +268,31 @@ def d42_get(path, credentials, params):
     if not base:
         raise ValueError('Set the Device42 URL under Settings first')
     response = requests.get(base + path, params=params, auth=credentials,
-                            verify=D42_VERIFY_TLS, timeout=25,
+                            verify=D42_VERIFY_TLS, timeout=(8, 35),
+                            allow_redirects=False,
                             headers={'Accept': 'application/json'})
-    response.raise_for_status()
-    return response.json()
+    status = response.status_code
+    content_type = response.headers.get('Content-Type', '').split(';', 1)[0][:80]
+    if 300 <= status < 400:
+        raise ValueError(
+            f'Device42 API {path} returned HTTP {status} redirect instead of JSON. '
+            'Check credentials, SSO/reverse proxy and endpoint access.')
+    if status >= 400:
+        raise ValueError(
+            f'Device42 API {path} returned HTTP {status} '
+            f'({content_type or "unknown content type"}). '
+            'Check API permissions, endpoint and proxy configuration.')
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError(
+            f'Device42 API {path} returned HTTP {status} '
+            f'({content_type or "unknown content type"}) instead of JSON. '
+            'Check API authentication, SSO/proxy interception or endpoint availability.'
+        ) from exc
+    if not isinstance(payload, (dict, list)):
+        raise ValueError(f'Device42 API {path} returned an unexpected JSON type')
+    return payload
 
 
 def d42_pages(path, names, credentials):
@@ -533,6 +560,15 @@ def device42_import(kind):
 @app.get('/api/export')
 def export():
     return jsonify(response_state())
+
+
+@app.errorhandler(500)
+def api_internal_error(_):
+    # Flask otherwise produces an HTML error page that the frontend cannot parse.
+    if request.path.startswith('/api/'):
+        return jsonify(error='MyVectors internal server error (HTTP 500). '
+                       'Check: docker compose logs --tail=100 myvectors'), 500
+    return 'Internal server error', 500
 
 
 @app.errorhandler(413)
