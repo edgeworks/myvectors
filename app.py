@@ -58,6 +58,9 @@ def connect():
       CREATE TABLE IF NOT EXISTS d42_ip_candidates (
         run_id TEXT NOT NULL, ip TEXT NOT NULL, record_id TEXT NOT NULL,
         PRIMARY KEY(run_id, ip, record_id));
+      CREATE TABLE IF NOT EXISTS d42_ip_targets (
+        run_id TEXT NOT NULL, seq INTEGER NOT NULL, ip TEXT NOT NULL,
+        PRIMARY KEY(run_id,ip), UNIQUE(run_id,seq));
       CREATE INDEX IF NOT EXISTS d42_ip_candidates_run ON d42_ip_candidates(run_id);
       CREATE INDEX IF NOT EXISTS edges_src ON edges(src);
       CREATE INDEX IF NOT EXISTS edges_dst ON edges(dst);
@@ -303,6 +306,30 @@ def d42_get(path, credentials, params):
     return payload
 
 
+
+def d42_post(path, credentials, form):
+    base = validate_d42_url(configured_d42_url())
+    if not base:
+        raise ValueError('Set the Device42 URL under Settings first')
+    response = requests.post(base + path, data=form, auth=credentials,
+                             verify=D42_VERIFY_TLS, timeout=(8, 35),
+                             allow_redirects=False,
+                             headers={'Accept': 'application/json'})
+    status = response.status_code
+    if 300 <= status < 400:
+        raise ValueError(f'Device42 DOQL returned HTTP {status} redirect instead of JSON')
+    if status >= 400:
+        raise ValueError(f'Device42 DOQL returned HTTP {status}; check query permissions and schema')
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise ValueError('Device42 DOQL returned non-JSON data; verify output_type=json') from exc
+    if not isinstance(payload, (dict, list)):
+        raise ValueError('Unexpected Device42 DOQL response format')
+    return payload
+
+
+
 def d42_pages(path, names, credentials):
     all_rows = []
     for page in range(20):  # deliberate bound: max 20,000 records per operation
@@ -528,7 +555,7 @@ def create_connection():
 
 # Keep individual Device42 calls small. The default 1000-record IP API response
 # has been observed to exceed Gunicorn's worker timeout on some appliances.
-D42_PAGE_SIZES = {'devices': 50, 'ip_links': 100}
+D42_PAGE_SIZES = {'devices': 50, 'ip_links': 25}
 D42_MAX_OFFSET = 100000
 
 
@@ -543,71 +570,127 @@ def d42_page_count(payload):
     return None
 
 
-def stage_ip_records(db, run_id, offset, rows):
-    """Stage candidate IDs in SQLite; only commit links after all pages arrive."""
+def start_nat_ip_run(db):
+    """Take a stable snapshot of unique NAT endpoint addresses only."""
     db.execute("DELETE FROM d42_ip_candidates WHERE run_id IN "
                "(SELECT run_id FROM d42_ip_runs WHERE created < datetime('now','-1 day'))")
+    db.execute("DELETE FROM d42_ip_targets WHERE run_id IN "
+               "(SELECT run_id FROM d42_ip_runs WHERE created < datetime('now','-1 day'))")
     db.execute("DELETE FROM d42_ip_runs WHERE created < datetime('now','-1 day')")
-    if offset == 0:
-        run_id = uuid4().hex
-        db.execute('INSERT INTO d42_ip_runs(run_id,next_offset) VALUES(?,0)', (run_id,))
-    else:
-        if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
-            raise ValueError('Invalid Device42 import session; restart the import')
-        item = db.execute('SELECT next_offset FROM d42_ip_runs WHERE run_id=?', (run_id,)).fetchone()
-        if not item or item['next_offset'] != offset:
-            raise ValueError('Device42 import session expired or pages are out of order; restart')
-    local_ips = {r['key'] for r in db.execute("SELECT key FROM nodes WHERE kind='ip'")}
-    readable = 0
+    ips = [r['key'] for r in db.execute("""
+        SELECT DISTINCT n.key FROM nodes AS n
+        WHERE n.kind='ip' AND n.id IN (
+            SELECT src FROM edges WHERE relation='nat_to' AND origin IN ('d42_nat','nat_csv')
+            UNION
+            SELECT dst FROM edges WHERE relation='nat_to' AND origin IN ('d42_nat','nat_csv')
+        ) ORDER BY n.key
+    """)]
+    if not ips:
+        raise ValueError('No NAT IP endpoints found. Import NAT data first.')
+    if len(ips) > D42_MAX_OFFSET:
+        raise ValueError('Too many NAT IP endpoints for one import')
+    run_id = uuid4().hex
+    db.execute('INSERT INTO d42_ip_runs(run_id,next_offset) VALUES(?,0)', (run_id,))
+    db.executemany('INSERT INTO d42_ip_targets(run_id,seq,ip) VALUES(?,?,?)',
+                   ((run_id, i, address) for i, address in enumerate(ips)))
+    return run_id, len(ips)
+
+
+def nat_ip_page(db, run_id, offset, limit):
+    if not isinstance(run_id, str) or not re.fullmatch(r'[0-9a-f]{32}', run_id):
+        raise ValueError('Invalid IP import session; restart')
+    run = db.execute('SELECT next_offset FROM d42_ip_runs WHERE run_id=?', (run_id,)).fetchone()
+    if not run or run['next_offset'] != offset:
+        raise ValueError('IP import session expired or out of order; restart')
+    total = db.execute('SELECT COUNT(*) FROM d42_ip_targets WHERE run_id=?', (run_id,)).fetchone()[0]
+    ips = [row['ip'] for row in db.execute(
+        'SELECT ip FROM d42_ip_targets WHERE run_id=? ORDER BY seq LIMIT ? OFFSET ?',
+        (run_id, limit, offset))]
+    if not ips:
+        raise ValueError('No more NAT IPs in this import session')
+    return ips, total
+
+
+def d42_nat_ip_query(credentials, ips):
+    """Read-only DOQL; input addresses normalized with ipaddress, never raw SQL."""
+    if not ips:
+        return []
+    normalized = [str(ipaddress.ip_address(ip)) for ip in ips]
+    quoted = ','.join("'" + ip + "'" for ip in normalized)
+    query = ('SELECT ip_address, ipaddress_pk FROM view_ipaddress_v1 '
+             'WHERE ip_address IN (' + quoted + ')')
+    payload = d42_post('/services/data/v1.0/query/', credentials,
+                       {'query': query, 'output_type': 'json'})
+    if isinstance(payload, list):
+        return payload
+    return extract_rows(payload, ('data', 'rows', 'results', 'items'))
+
+
+def stage_nat_ip_matches(db, run_id, offset, ips, rows):
+    """Validate exact matches and save matches without changing visible links."""
+    requested = set(ips)
+    validated = []
     fields = set()
     for record in rows:
         if not isinstance(record, dict):
-            continue
-        fields.update(str(k)[:65] for k in record.keys())
-        address = val(record, 'ip', 'ipaddress', 'ip_address', 'address', 'ip_address_value')
-        record_id = val(record, 'id', 'ip_id', 'ipaddress_id', 'ip_address_id', 'ipaddress_pk')
+            raise ValueError('Unexpected DOQL record type; no IP links were changed')
+        fields.update(str(k)[:60] for k in record)
+        address = val(record, 'ip_address')
+        record_id = val(record, 'ipaddress_pk')
         if not address or not record_id.isdecimal():
-            continue
+            raise ValueError('Unexpected DOQL fields: ' + ', '.join(sorted(fields)[:15]))
         try:
-            key = normalize('ip', address)
-        except ValueError:
-            continue
-        readable += 1
-        if key in local_ips:
-            db.execute('INSERT OR IGNORE INTO d42_ip_candidates(run_id,ip,record_id) VALUES(?,?,?)',
-                       (run_id, key, record_id))
-    if rows and readable == 0:
-        raise ValueError('Device42 IP field names not recognized: ' + ', '.join(sorted(fields)[:25]))
+            normalized = normalize('ip', address)
+        except ValueError as exc:
+            raise ValueError('Invalid IP returned by Device42 DOQL') from exc
+        if normalized not in requested:
+            raise ValueError('DOQL returned an IP outside the requested NAT addresses; import stopped')
+        validated.append((run_id, normalized, record_id))
+    db.executemany('INSERT OR IGNORE INTO d42_ip_candidates(run_id,ip,record_id) VALUES(?,?,?)',
+                   validated)
     db.execute('UPDATE d42_ip_runs SET next_offset=? WHERE run_id=?',
-               (offset + len(rows), run_id))
-    return run_id, readable
+               (offset + len(ips), run_id))
+    return len(validated)
 
 
 def finish_ip_run(db, run_id):
-    """Apply unique matches; clear stale links; never guess across overlapping VRFs."""
+    """Enrich NAT IPs only. Ignore unrelated IPs; never guess across VRFs."""
     mapping = {}
     for row in db.execute('SELECT ip,record_id FROM d42_ip_candidates WHERE run_id=?', (run_id,)):
         mapping.setdefault(row['ip'], set()).add(row['record_id'])
     matched = ambiguous = 0
-    items = db.execute("SELECT id,key,details FROM nodes WHERE kind='ip'").fetchall()
-    for row in items:
-        details = json.loads(row['details'])
-        for key in ('d42_ip_id','d42_ip_status','d42_ip_match_count'):
-            details.pop(key, None)
-        ids = mapping.get(row['key'], set())
-        if len(ids) == 1:
-            details['d42_ip_id'] = next(iter(ids))
-            matched += 1
-        elif len(ids) > 1:
-            details['d42_ip_status'] = 'ambiguous'
-            details['d42_ip_match_count'] = len(ids)
-            ambiguous += 1
-        db.execute('UPDATE nodes SET details=?,updated=? WHERE id=?',
-                   (json.dumps(details), now(), row['id']))
+    items = db.execute("""
+        SELECT n.id,n.key,n.details FROM nodes n
+        JOIN d42_ip_targets t ON n.key=t.ip AND t.run_id=?
+        WHERE n.kind='ip' ORDER BY t.seq
+    """, (run_id,)).fetchall()
+    if not mapping:
+        # No matches at all can indicate an incompatible DOQL schema or filter.
+        # Do not erase previously verified links on a zero-result import.
+        unchanged = True
+    else:
+        unchanged = False
+        for row in items:
+            details = json.loads(row['details'])
+            for key in ('d42_ip_id','d42_ip_status','d42_ip_match_count'):
+                details.pop(key, None)
+            ids = mapping.get(row['key'], set())
+            if len(ids) == 1:
+                details['d42_ip_id'] = next(iter(ids))
+                matched += 1
+            elif len(ids) > 1:
+                details['d42_ip_status'] = 'ambiguous'
+                details['d42_ip_match_count'] = len(ids)
+                ambiguous += 1
+            db.execute('UPDATE nodes SET details=?,updated=? WHERE id=?',
+                       (json.dumps(details), now(), row['id']))
     db.execute('DELETE FROM d42_ip_candidates WHERE run_id=?', (run_id,))
+    db.execute('DELETE FROM d42_ip_targets WHERE run_id=?', (run_id,))
     db.execute('DELETE FROM d42_ip_runs WHERE run_id=?', (run_id,))
     return {'linked': matched, 'ambiguous': ambiguous,
-            'not_found': len(items)-matched-ambiguous, 'ips_in_myvectors': len(items)}
+            'not_found': len(items)-matched-ambiguous,
+            'ips_in_myvectors': len(items), 'no_matches_preserved': unchanged}
+
 
 
 @app.post('/api/d42/<kind>/page')
@@ -622,57 +705,54 @@ def device42_import_page(kind):
     if type(offset) is not int or offset < 0 or offset > D42_MAX_OFFSET:
         return jsonify(error='Invalid page offset'), 400
     limit = D42_PAGE_SIZES[kind]
-    path = '/api/1.0/ips/' if kind == 'ip_links' else '/api/1.0/devices/all/'
-    names = ('ips', 'ip_addresses', 'ipaddresses') if kind == 'ip_links' else ('devices',)
     try:
-        if kind == 'ip_links' and offset:
-            # Check the checkpoint before making another potentially slow HTTP call.
-            run_id = data.get('run_id')
+        if kind == 'ip_links':
+            # Use only NAT endpoints; no GET /ips/ inventory crawl.
             with connect() as db:
-                existing = db.execute('SELECT next_offset FROM d42_ip_runs WHERE run_id=?',
-                                      (str(run_id),)).fetchone()
-            if not existing or existing['next_offset'] != offset:
-                return jsonify(error='IP import session expired or offset mismatch; restart'), 409
+                if offset == 0:
+                    run_id, count = start_nat_ip_run(db)
+                else:
+                    run_id = data.get('run_id')
+                ips, total = nat_ip_page(db, run_id, offset, limit)
+            rows = d42_nat_ip_query((username, password), ips)
+            next_offset = offset + len(ips)
+            done = next_offset >= total
+            with connect() as db:
+                # Checkpoint again in case another request advanced the session.
+                check, count = nat_ip_page(db, run_id, offset, limit)
+                if check != ips or count != total:
+                    raise ValueError('IP import session changed; restart the import')
+                found = stage_nat_ip_matches(db, run_id, offset, ips, rows)
+                result = {'run_id': run_id, 'received': len(ips), 'matches_received': found,
+                          'next_offset': next_offset, 'total_count': total, 'done': done}
+                if done:
+                    result.update(finish_ip_run(db, run_id))
+            return jsonify(result)
+        path = '/api/1.0/devices/all/'
         payload = d42_get(path, (username, password), {'limit': limit, 'offset': offset})
-        batch = extract_rows(payload, names)
+        batch = extract_rows(payload, ('devices',))
         if len(batch) > limit:
-            raise ValueError('Device42 ignored the requested page size; '
-                             'check Enforce API GET Limits in Device42 Global Settings')
+            raise ValueError('Device42 ignored the requested device page size')
         total = d42_page_count(payload)
         next_offset = offset + len(batch)
         if next_offset > D42_MAX_OFFSET:
-            raise ValueError('Device42 import reached the maximum 100,000 records')
-        # A configured appliance-side GET cap can be lower than our requested
-        # limit. Prefer total_count over page length so we do not stop early.
-        done = (next_offset >= total if total is not None else len(batch) < limit)
+            raise ValueError('Device42 device import reached maximum offset')
+        done = next_offset >= total if total is not None else len(batch) < limit
         if not batch and total is not None and next_offset < total:
-            raise ValueError('Device42 returned an empty page before total_count was reached; '
-                             'check offset/limit configuration')
-        if kind == 'ip_links' and offset == 0 and not batch:
-            raise ValueError('Device42 returned zero IP records; existing links were not changed')
-        result = {'received': len(batch), 'next_offset': next_offset,
-                  'done': done, 'total_count': total}
-        if kind == 'devices':
-            with connect() as db:
-                result['imported'] = import_devices(db, batch)
-        else:
-            with connect() as db:
-                run_id, readable = stage_ip_records(db, data.get('run_id'), offset, batch)
-                result['run_id'] = run_id
-                result['readable'] = readable
-                if done:
-                    result.update(finish_ip_run(db, run_id))
-        return jsonify(result)
-    except requests.exceptions.SSLError as exc:
-        return jsonify(error='Device42 TLS validation failed. Check CA chain and proxy: '
-                       + type(exc).__name__), 502
+            raise ValueError('Empty Device42 device page before total_count reached')
+        with connect() as db:
+            imported = import_devices(db, batch)
+        return jsonify(received=len(batch),next_offset=next_offset,done=done,
+                       total_count=total, imported=imported)
+    except requests.exceptions.SSLError:
+        return jsonify(error='Device42 TLS validation failed; check CA chain/proxy'), 502
     except requests.Timeout:
-        return jsonify(error=f'Device42 {path} did not respond to this {limit}-record page '
-                       'within the request timeout. Check API performance or reduce page size.'), 504
+        return jsonify(error='Device42 did not respond to this targeted request in time'), 504
     except requests.RequestException as exc:
         return jsonify(error=f'Device42 request failed: {type(exc).__name__}'), 502
     except ValueError as exc:
         return jsonify(error=str(exc)), 502
+
 
 
 @app.post('/api/d42/<kind>')
