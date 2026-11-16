@@ -58,6 +58,11 @@ def connect():
       CREATE TABLE IF NOT EXISTS d42_ip_candidates (
         run_id TEXT NOT NULL, ip TEXT NOT NULL, record_id TEXT NOT NULL,
         PRIMARY KEY(run_id, ip, record_id));
+      CREATE TABLE IF NOT EXISTS d42_ip_device_candidates (
+        run_id TEXT NOT NULL, ip TEXT NOT NULL, record_id TEXT NOT NULL,
+        device_id TEXT NOT NULL, device_name TEXT NOT NULL,
+        device_type TEXT NOT NULL DEFAULT '',
+        PRIMARY KEY(run_id,ip,record_id,device_id));
       CREATE TABLE IF NOT EXISTS d42_ip_targets (
         run_id TEXT NOT NULL, seq INTEGER NOT NULL, ip TEXT NOT NULL,
         PRIMARY KEY(run_id,ip), UNIQUE(run_id,seq));
@@ -391,6 +396,9 @@ def response_state():
             x['d42_url'] = device42_link(base, x['details']['d42_id'])
         if x['kind'] == 'ip':
             x['d42_url'] = device42_ip_link(base, x['details'].get('d42_ip_id'), ip_path)
+            # Build links at response time so changing the GUI URL updates them.
+            for candidate in x['details'].get('d42_devices', []):
+                candidate['url'] = device42_link(base, candidate.get('id', ''))
     return {'nodes': nodes, 'edges': edges}
 
 
@@ -529,6 +537,8 @@ def start_nat_ip_run(db):
     """Take a stable snapshot of unique NAT endpoint addresses only."""
     db.execute("DELETE FROM d42_ip_candidates WHERE run_id IN "
                "(SELECT run_id FROM d42_ip_runs WHERE created < datetime('now','-1 day'))")
+    db.execute("DELETE FROM d42_ip_device_candidates WHERE run_id IN "
+               "(SELECT run_id FROM d42_ip_runs WHERE created < datetime('now','-1 day'))")
     db.execute("DELETE FROM d42_ip_targets WHERE run_id IN "
                "(SELECT run_id FROM d42_ip_runs WHERE created < datetime('now','-1 day'))")
     db.execute("DELETE FROM d42_ip_runs WHERE created < datetime('now','-1 day')")
@@ -572,8 +582,17 @@ def d42_nat_ip_query(credentials, ips):
         return []
     normalized = [str(ipaddress.ip_address(ip)) for ip in ips]
     quoted = ','.join("'" + ip + "'" for ip in normalized)
-    query = ('SELECT ip_address, ipaddress_pk FROM view_ipaddress_v1 '
-             'WHERE ip_address IN (' + quoted + ')')
+    # This is a many-to-many association. A single IP may have zero, one,
+    # or several D42 devices; a device may also represent a cluster.
+    query = ('SELECT ip.ip_address AS ip_address, '
+             'ip.ipaddress_pk AS ipaddress_pk, '
+             'dev.device_pk AS device_pk, '
+             'dev.name AS device_name, dev.type AS device_type '
+             'FROM view_ipaddress_v1 ip '
+             'LEFT JOIN view_ipaddress_device_v2 assoc '
+             'ON assoc.ipaddress_fk = ip.ipaddress_pk '
+             'LEFT JOIN view_device_v1 dev ON dev.device_pk = assoc.device_fk '
+             'WHERE ip.ip_address IN (' + quoted + ')')
     payload = d42_post('/services/data/v1.0/query/', credentials,
                        {'query': query, 'output_type': 'json'})
     if isinstance(payload, list):
@@ -582,70 +601,124 @@ def d42_nat_ip_query(credentials, ips):
 
 
 def stage_nat_ip_matches(db, run_id, offset, ips, rows):
-    """Validate exact matches and save matches without changing visible links."""
+    """Stage exact D42 IP and its zero/many device associations, safely."""
     requested = set(ips)
     validated = []
+    devices = []
     fields = set()
     for record in rows:
         if not isinstance(record, dict):
-            raise ValueError('Unexpected DOQL record type; no IP links were changed')
+            raise ValueError('Unexpected DOQL record type; no mappings changed')
         fields.update(str(k)[:60] for k in record)
         address = val(record, 'ip_address')
         record_id = val(record, 'ipaddress_pk')
         if not address or not record_id.isdecimal():
             raise ValueError('Unexpected DOQL fields: ' + ', '.join(sorted(fields)[:15]))
         try:
-            normalized = normalize('ip', address)
+            ip = normalize('ip', address)
         except ValueError as exc:
             raise ValueError('Invalid IP returned by Device42 DOQL') from exc
-        if normalized not in requested:
-            raise ValueError('DOQL returned an IP outside the requested NAT addresses; import stopped')
-        validated.append((run_id, normalized, record_id))
+        if ip not in requested:
+            raise ValueError('DOQL returned an IP outside requested NAT addresses; import stopped')
+        validated.append((run_id, ip, record_id))
+        device_id = val(record, 'device_pk')
+        device_name = val(record, 'device_name')
+        device_type = val(record, 'device_type')
+        if device_id or device_name:
+            if not device_id.isdecimal() or not device_name:
+                raise ValueError('Incomplete Device42 device association for an IP; no mappings changed')
+            devices.append((run_id, ip, record_id, device_id,
+                            device_name[:255], device_type[:100]))
     db.executemany('INSERT OR IGNORE INTO d42_ip_candidates(run_id,ip,record_id) VALUES(?,?,?)',
                    validated)
+    db.executemany('INSERT OR REPLACE INTO d42_ip_device_candidates '
+                   '(run_id,ip,record_id,device_id,device_name,device_type) '
+                   'VALUES(?,?,?,?,?,?)', devices)
     db.execute('UPDATE d42_ip_runs SET next_offset=? WHERE run_id=?',
                (offset + len(ips), run_id))
     return len(validated)
 
 
 def finish_ip_run(db, run_id):
-    """Enrich NAT IPs only. Ignore unrelated IPs; never guess across VRFs."""
+    """Commit a complete NAT-IP snapshot, preserving zero/one/many D42 associations."""
     mapping = {}
-    for row in db.execute('SELECT ip,record_id FROM d42_ip_candidates WHERE run_id=?', (run_id,)):
-        mapping.setdefault(row['ip'], set()).add(row['record_id'])
-    matched = ambiguous = 0
+    for item in db.execute('SELECT ip,record_id FROM d42_ip_candidates WHERE run_id=?',
+                           (run_id,)):
+        mapping.setdefault(item['ip'], set()).add(item['record_id'])
+    device_by_ip = {}
+    for item in db.execute('SELECT * FROM d42_ip_device_candidates WHERE run_id=?', (run_id,)):
+        device_by_ip.setdefault(item['ip'], {})[item['device_id']] = {
+            'id': item['device_id'], 'name': item['device_name'],
+            'type': item['device_type'], 'ip_record_id': item['record_id']}
+    matched = ambiguous = unassigned = multi_device = mapped_device = 0
     items = db.execute("""
         SELECT n.id,n.key,n.details FROM nodes n
         JOIN d42_ip_targets t ON n.key=t.ip AND t.run_id=?
         WHERE n.kind='ip' ORDER BY t.seq
     """, (run_id,)).fetchall()
-    if not mapping:
-        # No matches at all can indicate an incompatible DOQL schema or filter.
-        # Do not erase previously verified links on a zero-result import.
-        unchanged = True
-    else:
-        unchanged = False
-        for row in items:
-            details = json.loads(row['details'])
-            for key in ('d42_ip_id','d42_ip_status','d42_ip_match_count'):
+    unchanged = not mapping
+    if not unchanged:
+        # Remove only relations previously created by this exact enrichment,
+        # never manual relationships or those from the device inventory import.
+        for item in items:
+            db.execute("DELETE FROM edges WHERE src=? AND relation='belongs_to' "
+                       "AND origin='d42_ip_assoc'", (item['id'],))
+        for item in items:
+            details = json.loads(item['details'])
+            for key in ('d42_ip_id', 'd42_ip_status', 'd42_ip_match_count',
+                        'd42_devices', 'd42_device_status'):
                 details.pop(key, None)
-            ids = mapping.get(row['key'], set())
-            if len(ids) == 1:
-                details['d42_ip_id'] = next(iter(ids))
+            ip_ids = mapping.get(item['key'], set())
+            candidates = sorted(device_by_ip.get(item['key'], {}).values(),
+                                key=lambda c: (c['name'].lower(), c['id']))
+            details['d42_devices'] = candidates
+            if len(ip_ids) == 1:
+                details['d42_ip_id'] = next(iter(ip_ids))
                 matched += 1
-            elif len(ids) > 1:
+            elif len(ip_ids) > 1:
                 details['d42_ip_status'] = 'ambiguous'
-                details['d42_ip_match_count'] = len(ids)
+                details['d42_ip_match_count'] = len(ip_ids)
                 ambiguous += 1
+
+            if not ip_ids:
+                details['d42_device_status'] = 'ip_not_found'
+            elif len(ip_ids) > 1:
+                details['d42_device_status'] = 'ambiguous_ip'
+            elif not candidates:
+                details['d42_device_status'] = 'unassigned'
+                unassigned += 1
+            elif len(candidates) > 1:
+                details['d42_device_status'] = 'multiple'
+                multi_device += 1
+            elif 'cluster' in candidates[0]['type'].lower():
+                details['d42_device_status'] = 'cluster'
+            else:
+                details['d42_device_status'] = 'single'
+            if candidates:
+                mapped_device += 1
             db.execute('UPDATE nodes SET details=?,updated=? WHERE id=?',
-                       (json.dumps(details), now(), row['id']))
-    db.execute('DELETE FROM d42_ip_candidates WHERE run_id=?', (run_id,))
-    db.execute('DELETE FROM d42_ip_targets WHERE run_id=?', (run_id,))
-    db.execute('DELETE FROM d42_ip_runs WHERE run_id=?', (run_id,))
+                       (json.dumps(details), now(), item['id']))
+            # For ambiguous IPs across VRFs, the device is not safely tied to
+            # this IP node. Display the candidates but do not assert graph edges.
+            if len(ip_ids) == 1:
+                for candidate in candidates:
+                    device = node(db, 'device', 'd42:' + candidate['id'],
+                                  label=candidate['name'],
+                                  details={'d42_id': candidate['id'],
+                                           'type': candidate['type'],
+                                           'source': 'd42_ip_assoc'})
+                    edge(db, item['id'], device, 'belongs_to', 'd42_ip_assoc',
+                         ref=next(iter(ip_ids)) + ':' + candidate['id'],
+                         note='Device42 IP association; not a verified Octosam identity')
+    for table in ('d42_ip_device_candidates', 'd42_ip_candidates',
+                  'd42_ip_targets', 'd42_ip_runs'):
+        db.execute('DELETE FROM ' + table + ' WHERE run_id=?', (run_id,))
     return {'linked': matched, 'ambiguous': ambiguous,
             'not_found': len(items)-matched-ambiguous,
-            'ips_in_myvectors': len(items), 'no_matches_preserved': unchanged}
-
+            'ips_in_myvectors': len(items), 'no_matches_preserved': unchanged,
+            'with_device_candidates': mapped_device,
+            'multiple_device_candidates': multi_device,
+            'unassigned_device': unassigned}
 
 
 @app.post('/api/d42/<kind>/page')
