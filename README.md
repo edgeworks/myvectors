@@ -45,7 +45,9 @@ TLS validation is enabled for Device42 by default. Provide your internal CA to t
 
 ## Troubleshooting Device42 imports
 
-If **Import devices & IPs** or **Import IP links** fails, the application reports the HTTP status, response type and requested endpoint instead of displaying raw HTML. A 302 redirect commonly points to SSO/login or proxy routing; 401/403 suggests authentication or permissions; 404 suggests a missing endpoint; HTTP 200 with HTML can indicate a login page or proxy response. MyVectors also handles nested Device42 `Devices` result objects and allows up to 240 seconds per import before Gunicorn's worker timeout.
+**Import devices & IPs** and **Import IP links** now use incremental, manually triggered API requests (50 detailed devices or 100 IP records per page). Progress appears below the import controls, with **Stop import** available between requests. Device imports retain successfully processed pages if stopped; IP links are staged in SQLite and applied only after the complete import, so an interrupted IP import does not partially replace existing links. Stale staging data is discarded after one day. Device42 supports `limit`/`offset` pagination; if the appliance ignores the page limit, enable **Enforce API GET Limits** in Device42's Global Settings. Individual slow pages still depend on the appliance's response time.
+
+If an API import fails, MyVectors reports the HTTP status, response type and requested endpoint rather than displaying raw HTML. A 302 redirect suggests SSO/login or proxy routing; 401/403 suggests permissions; 404 suggests an endpoint mismatch; HTTP 200 with HTML can indicate a login page or proxy response. Nested Device42 `Devices` responses are supported.
 
 For unexpected HTTP 500, 502 or 504 responses, inspect server-side logs:
 
