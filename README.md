@@ -43,6 +43,18 @@ Device42 versions can vary in API response structure. Import requests are limite
 
 TLS validation is enabled for Device42 by default. Provide your internal CA to the container if needed instead of disabling verification. Make sure your container's `NO_PROXY` includes the internal Device42 host where a proxy is configured.
 
+## Troubleshooting Device42 imports
+
+If **Import devices & IPs** or **Import IP links** fails, the application reports the HTTP status, response type and requested endpoint instead of displaying raw HTML. A 302 redirect commonly points to SSO/login or proxy routing; 401/403 suggests authentication or permissions; 404 suggests a missing endpoint; HTTP 200 with HTML can indicate a login page or proxy response. MyVectors also handles nested Device42 `Devices` result objects and allows up to 240 seconds per import before Gunicorn's worker timeout.
+
+For unexpected HTTP 500, 502 or 504 responses, inspect server-side logs:
+
+```bash
+docker compose logs --tail=100 myvectors
+```
+
+Do not post raw Device42 data or credentials. The browser displays only HTTP status/content type rather than copying remote HTML responses.
+
 ## Tests
 
 ```bash
