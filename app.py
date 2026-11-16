@@ -642,7 +642,14 @@ def device42_import_page(kind):
         next_offset = offset + len(batch)
         if next_offset > D42_MAX_OFFSET:
             raise ValueError('Device42 import reached the maximum 100,000 records')
-        done = len(batch) < limit or (total is not None and next_offset >= total)
+        # A configured appliance-side GET cap can be lower than our requested
+        # limit. Prefer total_count over page length so we do not stop early.
+        done = (next_offset >= total if total is not None else len(batch) < limit)
+        if not batch and total is not None and next_offset < total:
+            raise ValueError('Device42 returned an empty page before total_count was reached; '
+                             'check offset/limit configuration')
+        if kind == 'ip_links' and offset == 0 and not batch:
+            raise ValueError('Device42 returned zero IP records; existing links were not changed')
         result = {'received': len(batch), 'next_offset': next_offset,
                   'done': done, 'total_count': total}
         if kind == 'devices':
