@@ -79,8 +79,8 @@ def test_device42_settings_local_and_links_refresh(client, monkeypatch):
     assert device['d42_url'].startswith('https://d42-two.example/')
     calls = []
     class Resp:
-        def raise_for_status(self):
-            pass
+        status_code = 200
+        headers = {'Content-Type': 'application/json'}
         def json(self):
             return {'devices': []}
     def fake_get(url, **kw):
@@ -208,3 +208,34 @@ def test_ip_links_schema_validation_and_api_endpoint(client, monkeypatch):
     assert calls[0][0] == '/api/1.0/ips/'
     assert calls[0][2] == ('demo', 'transient')
     assert 'transient' not in str(client.get('/api/state').json)
+
+
+def test_device42_response_diagnostics(client, monkeypatch):
+    monkeypatch.setattr(m, 'D42_URL', 'https://d42.example')
+    assert m.extract_rows({'Devices': {'devices': [{'device_id': 77}]}},
+                          ('devices',)) == [{'device_id': 77}]
+    assert m.extract_rows({'Devices': [{'device_id': 77}]},
+                          ('devices',)) == [{'device_id': 77}]
+    class Response:
+        def __init__(self, status, content_type, body):
+            self.status_code = status
+            self.headers = {'Content-Type': content_type}
+            self.body = body
+        def json(self):
+            if isinstance(self.body, Exception):
+                raise self.body
+            return self.body
+
+    results = [
+        (Response(302, 'text/html', ValueError('redirect login page')), 'HTTP 302 redirect'),
+        (Response(200, 'text/html', ValueError('html login page')), 'instead of JSON'),
+        (Response(404, 'text/html', ValueError('not found page')), 'HTTP 404'),
+    ]
+    for response, error in results:
+        monkeypatch.setattr(m.requests, 'get', lambda *args, **kwargs: response)
+        with pytest.raises(ValueError, match=error):
+            m.d42_get('/api/1.0/ips/', ('user', 'secret'), {'limit': 1000})
+
+    monkeypatch.setattr(m.requests, 'get', lambda *args, **kwargs:
+                        Response(200, 'application/json', {'ips': [{'id': 1}]}))
+    assert m.d42_get('/api/1.0/ips/', ('user', 'secret'), {}) == {'ips': [{'id': 1}]}
