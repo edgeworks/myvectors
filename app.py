@@ -378,51 +378,6 @@ def import_devices(db, rows):
     return count
 
 
-def import_ip_links(db, rows):
-    """Enrich existing IP nodes from D42's IP inventory. Never create false mappings."""
-    local = {r['key']: r for r in db.execute("SELECT id,key,details FROM nodes WHERE kind='ip'")}
-    candidates = {}
-    fields = set()
-    readable = 0
-    for record in rows:
-        if not isinstance(record, dict):
-            continue
-        fields.update(str(key)[:70] for key in record)
-        address = val(record, 'ip', 'ipaddress', 'ip_address', 'address', 'ip_address_value')
-        ip_id = val(record, 'id', 'ip_id', 'ipaddress_id', 'ip_address_id', 'ipaddress_pk')
-        if not address or not ip_id.isdecimal():
-            continue
-        try:
-            key = normalize('ip', address)
-        except ValueError:
-            continue
-        readable += 1
-        if key in local:
-            candidates.setdefault(key, set()).add(ip_id)
-    if rows and not readable:
-        raise ValueError('IP API schema not recognized; available field names: ' +
-                         ', '.join(sorted(fields)[:20]))
-    matched = ambiguous = 0
-    for key, row in local.items():
-        ids = candidates.get(key, set())
-        details = json.loads(row['details'])
-        details.pop('d42_ip_id', None)
-        details.pop('d42_ip_status', None)
-        details.pop('d42_ip_match_count', None)
-        if len(ids) == 1:
-            details['d42_ip_id'] = next(iter(ids))
-            matched += 1
-        elif len(ids) > 1:
-            details['d42_ip_status'] = 'ambiguous'
-            details['d42_ip_match_count'] = len(ids)
-            ambiguous += 1
-        db.execute('UPDATE nodes SET details=?,updated=? WHERE id=?',
-                   (json.dumps(details), now(), row['id']))
-    return {'linked': matched, 'ambiguous': ambiguous, 'not_found': len(local)-matched-ambiguous,
-            'ips_in_myvectors': len(local), 'records_received': len(rows),
-            'ip_api_field_names': sorted(fields)[:40]}
-
-
 def response_state():
     with connect() as db:
         nodes = [dict(x) for x in db.execute('SELECT * FROM nodes ORDER BY kind,label')]
