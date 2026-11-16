@@ -86,7 +86,21 @@ function notify(message,error=false){
     toastTimer=setTimeout(()=>t.classList.add('hidden'),5000);
   }
 }
-async function api(url,options={}){let r=await fetch(url,options);let d=await r.json();if(!r.ok)throw new Error(d.error||('HTTP '+r.status));return d}
+async function api(url,options={}){
+  const response=await fetch(url,options);
+  const type=(response.headers.get('content-type')||'').toLowerCase();
+  if(!type.includes('json')){
+    throw new Error('MyVectors returned HTTP '+response.status+
+      ' ('+(type||'unknown content type')+') instead of JSON for '+url+
+      '. Check "docker compose logs --tail=100 myvectors" on the server; '+
+      'also check any reverse proxy for 502/504 timeouts.');
+  }
+  let data;
+  try{data=await response.json()}
+  catch(_){throw new Error('MyVectors returned invalid JSON (HTTP '+response.status+') for '+url)}
+  if(!response.ok)throw new Error(data?.error||('MyVectors API HTTP '+response.status));
+  return data;
+}
 async function refresh(){dataset=await api('/api/state');const all=new Set(dataset.nodes.map(n=>n.id));selectedIds=new Set([...selectedIds].filter(id=>all.has(id)));if(selected!==null&&!all.has(selected))selected=null;if(focus!==null&&!all.has(focus))focus=null;$('#total').textContent=dataset.nodes.length;$('#domains').textContent=dataset.nodes.filter(n=>n.kind==='domain').length;$('#connections').textContent=dataset.edges.length;render()}
 function el(tag,text='',cls=''){let e=document.createElement(tag);e.textContent=text;if(cls)e.className=cls;return e}
 function natRelatedIds(){
