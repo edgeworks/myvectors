@@ -298,9 +298,89 @@ def test_doql_post_sends_only_known_ip_addresses(client,monkeypatch):
     data=m.d42_nat_ip_query(('analyst','secret'),['10.0.0.1'])
     assert data==[{'ip_address':'10.0.0.1','ipaddress_pk':1}]
     assert sent[0][0]=='https://d42.example/services/data/v1.0/query/'
-    assert 'WHERE ip_address IN (\'10.0.0.1\')' in sent[0][1]['data']['query']
+    assert "WHERE ip.ip_address IN ('10.0.0.1')" in sent[0][1]['data']['query']
     assert sent[0][1]['data']['output_type']=='json'
     assert sent[0][1]['auth']==('analyst','secret')
+
+
+
+def test_ip_device_candidates_zero_one_many_cluster_and_ambiguous_vrf(client, monkeypatch):
+    assert client.put('/api/settings',json={'device42_url':'https://d42.example'}).status_code==200
+    ips = ['203.0.113.10', '10.0.0.10', '10.0.0.11', '10.0.0.12', '10.0.0.13']
+    with m.connect() as db:
+        ids = [m.node(db,'ip',ip) for ip in ips]
+        for i in range(1,len(ids)):
+            m.edge(db,ids[0],ids[i],'nat_to','d42_nat')
+        device=m.node(db,'device','manual-name')
+        m.edge(db,ids[1],device,'belongs_to','manual')
+    rows = [
+        {'ip_address':ips[0], 'ipaddress_pk':100, 'device_pk':55,
+         'device_name':'server-01', 'device_type':'Virtual'},
+        {'ip_address':ips[1], 'ipaddress_pk':101, 'device_pk':56,
+         'device_name':'server-02', 'device_type':'Physical'},
+        {'ip_address':ips[1], 'ipaddress_pk':101, 'device_pk':57,
+         'device_name':'loadbalancer-a', 'device_type':'Virtual'},
+        {'ip_address':ips[2], 'ipaddress_pk':102, 'device_pk':None,
+         'device_name':None, 'device_type':None},
+        {'ip_address':ips[3], 'ipaddress_pk':103, 'device_pk':58,
+         'device_name':'device-in-vrf-one', 'device_type':'Physical'},
+        {'ip_address':ips[3], 'ipaddress_pk':104, 'device_pk':59,
+         'device_name':'device-in-vrf-two', 'device_type':'Physical'},
+        {'ip_address':ips[4], 'ipaddress_pk':105, 'device_pk':60,
+         'device_name':'cluster-01', 'device_type':'Cluster'},
+    ]
+    monkeypatch.setattr(m,'d42_nat_ip_query',lambda creds,addresses: rows)
+    r=client.post('/api/d42/ip_links/page',json={'username':'analyst','password':'x'})
+    assert r.status_code==200
+    assert r.json['with_device_candidates']==4
+    assert r.json['multiple_device_candidates']==1
+    assert r.json['unassigned_device']==1
+    state=client.get('/api/state').json
+    by_ip={n['key']:n for n in state['nodes'] if n['kind']=='ip'}
+    assert by_ip[ips[0]]['details']['d42_device_status']=='single'
+    assert by_ip[ips[0]]['details']['d42_devices'][0]['name']=='server-01'
+    assert by_ip[ips[0]]['details']['d42_devices'][0]['url'].endswith('/admin/rackraj/device/55/')
+    assert by_ip[ips[1]]['details']['d42_device_status']=='multiple'
+    assert len(by_ip[ips[1]]['details']['d42_devices'])==2
+    assert by_ip[ips[2]]['details']['d42_device_status']=='unassigned'
+    assert by_ip[ips[2]]['details']['d42_devices']==[]
+    assert by_ip[ips[3]]['details']['d42_device_status']=='ambiguous_ip'
+    assert by_ip[ips[3]]['d42_url']==''
+    assert by_ip[ips[4]]['details']['d42_device_status']=='cluster'
+    links=[e for e in state['edges'] if e['origin']=='d42_ip_assoc']
+    assert len(links)==4
+    assert ids[3] not in [e['src'] for e in links]
+    assert any(e['origin']=='manual' for e in state['edges'])
+    assert all(e['note']=='Device42 IP association; not a verified Octosam identity' for e in links)
+    candidates=[n for n in state['nodes'] if n['kind']=='device' and n['key'].startswith('d42:')]
+    assert len(candidates)==4
+    assert all(n['d42_url'].startswith('https://d42.example/admin/rackraj/device/') for n in candidates)
+
+
+def test_ip_device_candidate_refresh_removes_stale_edges_not_manual(client, monkeypatch):
+    with m.connect() as db:
+        a=m.node(db,'ip','203.0.113.5')
+        b=m.node(db,'ip','10.1.1.5')
+        m.edge(db,a,b,'nat_to','nat_csv')
+        manual=m.node(db,'device','manually-verified')
+        m.edge(db,b,manual,'belongs_to','manual')
+    output=[{'ip_address':'10.1.1.5','ipaddress_pk':100,
+             'device_pk':9,'device_name':'temporary','device_type':'Physical'},
+            {'ip_address':'203.0.113.5','ipaddress_pk':101,
+             'device_pk':None,'device_name':None}]
+    monkeypatch.setattr(m,'d42_nat_ip_query',lambda creds,ips: output)
+    assert client.post('/api/d42/ip_links/page',json={'username':'u','password':'p'}).status_code==200
+    edges=client.get('/api/state').json['edges']
+    assert len([e for e in edges if e['origin']=='d42_ip_assoc'])==1
+    output[0]={'ip_address':'10.1.1.5','ipaddress_pk':100,
+               'device_pk':None,'device_name':None}
+    assert client.post('/api/d42/ip_links/page',json={'username':'u','password':'p'}).status_code==200
+    state=client.get('/api/state').json
+    assert len([e for e in state['edges'] if e['origin']=='d42_ip_assoc'])==0
+    assert len([e for e in state['edges'] if e['origin']=='manual'])==1
+    ip=next(n for n in state['nodes'] if n['key']=='10.1.1.5')
+    assert ip['details']['d42_device_status']=='unassigned'
+
 
 
 def test_devices_import_one_page_per_request(client, monkeypatch):
