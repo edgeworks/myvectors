@@ -150,67 +150,42 @@ def test_device42_real_nat_api_field_names(client):
     assert any(e['details']['target_port'] == '8443' for e in st['edges'])
 
 
-def test_ip_links_match_existing_nodes_only_and_avoid_ambiguous_vrfs(client):
+def test_targeted_nat_ip_lookup_and_links(client, monkeypatch):
     assert client.put('/api/settings', json={'device42_url': 'https://d42.example'}).status_code == 200
     with m.connect() as db:
-        m.node(db, 'ip', '203.0.113.10')
-        m.node(db, 'ip', '10.0.0.10')
-        m.node(db, 'ip', '10.0.0.11')
-        m.node(db, 'domain', 'web.example')
-    rows = [
-        {'ipaddress': '203.0.113.10', 'id': 101},
-        {'ip_address': '10.0.0.10', 'ip_address_id': 202},
-        {'ip': '10.0.0.10', 'id': '203', 'vrf_group': 'other'},
-        {'ipaddress': '192.0.2.100', 'id': 555}
-    ]
-    with m.connect() as db:
-        result = m.import_ip_links(db, rows)
-    assert result['linked'] == 1
-    assert result['ambiguous'] == 1
-    assert result['not_found'] == 1
-    state = client.get('/api/state').json
-    by_key = {x['key']: x for x in state['nodes']}
-    assert len(state['nodes']) == 4
-    assert by_key['203.0.113.10']['d42_url'] == 'https://d42.example/admin/rackraj/ipaddress/101/'
-    assert by_key['10.0.0.10']['d42_url'] == ''
-    assert by_key['10.0.0.10']['details']['d42_ip_status'] == 'ambiguous'
-    assert by_key['10.0.0.11']['d42_url'] == ''
-    assert client.put('/api/settings', json={'device42_url': 'https://other.example',
-        'device42_ip_path': '/custom/ip/{id}/'}).status_code == 200
-    state = client.get('/api/state').json
-    new_url = next(x['d42_url'] for x in state['nodes'] if x['key']=='203.0.113.10')
-    assert new_url == 'https://other.example/custom/ip/101/'
-    assert client.put('/api/settings', json={'device42_url': 'https://other.example',
-        'device42_ip_path': '//bad/{id}/'}).status_code == 400
-    assert client.put('/api/settings', json={'device42_url': 'https://other.example',
-        'device42_ip_path': '/bad/link'}).status_code == 400
-    with m.connect() as db:
-        result = m.import_ip_links(db, [{'ipaddress': '203.0.113.10', 'id': 101}])
-    state = client.get('/api/state').json
-    assert next(x for x in state['nodes'] if x['key']=='10.0.0.10')['d42_url'] == ''
+        a=m.node(db, 'ip', '203.0.113.10')
+        b=m.node(db, 'ip', '10.0.0.10')
+        m.edge(db,a,b,'nat_to','d42_nat')
+        m.node(db, 'ip', '10.0.0.11',details={'d42_ip_id':'unrelated'})
+    calls=[]
+    def fake_lookup(credentials, ips):
+        calls.append(ips)
+        return [{'ip_address':'203.0.113.10','ipaddress_pk':101},
+                {'ip_address':'10.0.0.10','ipaddress_pk':202},
+                {'ip_address':'10.0.0.10','ipaddress_pk':203}]
+    monkeypatch.setattr(m,'d42_nat_ip_query',fake_lookup)
+    r=client.post('/api/d42/ip_links/page',json={'username':'u','password':'pw'})
+    assert r.status_code==200
+    assert r.json['done'] is True
+    assert r.json['linked']==1 and r.json['ambiguous']==1
+    assert set(calls[0])=={'203.0.113.10','10.0.0.10'}
+    data={n['key']:n for n in client.get('/api/state').json['nodes']}
+    assert data['203.0.113.10']['d42_url']=='https://d42.example/admin/rackraj/ipaddress/101/'
+    assert data['10.0.0.10']['d42_url']==''
+    assert data['10.0.0.10']['details']['d42_ip_status']=='ambiguous'
+    assert data['10.0.0.11']['details']['d42_ip_id']=='unrelated'
+    assert client.put('/api/settings',json={'device42_url':'https://new.example',
+        'device42_ip_path':'/custom/{id}/'}).status_code==200
+    data={n['key']:n for n in client.get('/api/state').json['nodes']}
+    assert data['203.0.113.10']['d42_url']=='https://new.example/custom/101/'
 
 
-def test_ip_links_schema_validation_and_api_endpoint(client, monkeypatch):
+def test_targeted_nat_ip_lookup_requires_nat_edges(client):
     with m.connect() as db:
-        m.node(db, 'ip', '198.51.100.14')
-    with m.connect() as db:
-        with pytest.raises(ValueError, match='schema not recognized'):
-            m.import_ip_links(db, [{'unexpected': 'value'}])
-    monkeypatch.setattr(m, 'D42_URL', 'https://d42.example')
-    calls = []
-    def fake_get(path, credentials, params):
-        calls.append((path, credentials, params))
-        return {'ips': [{'ipaddress': '198.51.100.14', 'id': 88}], 'total_count': 1}
-    monkeypatch.setattr(m, 'd42_get', fake_get)
-    result = client.post('/api/d42/ip_links/page', json={'username': 'demo',
-                         'password': 'transient', 'offset': 0})
-    assert result.status_code == 200
-    assert result.json['linked'] == 1
-    assert result.json['done'] is True
-    assert calls[0][0] == '/api/1.0/ips/'
-    assert calls[0][1] == ('demo', 'transient')
-    assert calls[0][2] == {'limit': 100, 'offset': 0}
-    assert 'transient' not in str(client.get('/api/state').json)
+        m.node(db,'ip','192.0.2.10')
+    r=client.post('/api/d42/ip_links/page',json={'username':'u','password':'p'})
+    assert r.status_code==502
+    assert 'Import NAT data first' in r.json['error']
 
 
 def test_device42_response_diagnostics(client, monkeypatch):
@@ -246,46 +221,86 @@ def test_device42_response_diagnostics(client, monkeypatch):
 
 
 def test_ip_page_import_stages_until_complete(client, monkeypatch):
-    assert client.put('/api/settings', json={'device42_url': 'https://d42.example'}).status_code == 200
-    monkeypatch.setitem(m.D42_PAGE_SIZES, 'ip_links', 2)
+    assert client.put('/api/settings',json={'device42_url':'https://d42.example'}).status_code==200
+    monkeypatch.setitem(m.D42_PAGE_SIZES,'ip_links',2)
     with m.connect() as db:
-        m.node(db, 'ip', '10.1.1.1', details={'d42_ip_id': 'old'})
-        m.node(db, 'ip', '10.1.1.2')
-        m.node(db, 'ip', '10.1.1.3')
-    calls = []
-    def fake_get(path, credentials, params):
-        calls.append(params)
-        records = [
-            {'ipaddress': '10.1.1.1', 'id': 1},
-            {'ipaddress': '10.1.1.2', 'id': 2},
-            {'ipaddress': '10.1.1.2', 'id': 3},
-        ]
-        return {'ips': records[params['offset']:params['offset']+params['limit']],
-                'total_count': len(records)}
-    monkeypatch.setattr(m, 'd42_get', fake_get)
-    args = {'username': 'user', 'password': 'secret'}
-    first = client.post('/api/d42/ip_links/page', json={**args, 'offset': 0})
-    assert first.status_code == 200
-    assert first.json['received'] == 2
+        ids=[m.node(db,'ip',addr) for addr in ('10.1.1.1','10.1.1.2','10.1.1.3')]
+        for i in (1,2):
+            m.edge(db,ids[0],ids[i],'nat_to','d42_nat')
+        m.node(db,'ip','192.0.2.2',details={'d42_ip_id':'other'})
+        m.node(db,'ip','10.1.1.1',details={'d42_ip_id':'old'})
+    calls=[]
+    def fake_lookup(credentials,ips):
+        calls.append(ips)
+        out=[{'ip_address':ip,'ipaddress_pk':int(ip.rsplit('.',1)[-1])} for ip in ips]
+        if '10.1.1.2' in ips:
+            out.append({'ip_address':'10.1.1.2','ipaddress_pk':999})
+        return out
+    monkeypatch.setattr(m,'d42_nat_ip_query',fake_lookup)
+    args={'username':'user','password':'password'}
+    first=client.post('/api/d42/ip_links/page',json={**args,'offset':0})
+    assert first.status_code==200
+    assert first.json['received']==2
+    assert first.json['total_count']==3
     assert first.json['done'] is False
-    old_id = next(n['details']['d42_ip_id'] for n in client.get('/api/state').json['nodes']
-                  if n['key'] == '10.1.1.1')
-    assert old_id == 'old'  # No partial updates before the last page.
-    second = client.post('/api/d42/ip_links/page',
-                         json={**args, 'offset': 2, 'run_id': first.json['run_id']})
-    assert second.status_code == 200
+    before={n['key']:n for n in client.get('/api/state').json['nodes']}
+    assert before['10.1.1.1']['details']['d42_ip_id']=='old'
+    bad=client.post('/api/d42/ip_links/page',json={**args,'offset':2,'run_id':'invalid'})
+    assert bad.status_code==502
+    second=client.post('/api/d42/ip_links/page',
+                       json={**args,'offset':2,'run_id':first.json['run_id']})
+    assert second.status_code==200
     assert second.json['done'] is True
-    assert second.json['linked'] == 1
-    assert second.json['ambiguous'] == 1
-    assert second.json['not_found'] == 1
+    assert second.json['linked']==2
+    assert second.json['ambiguous']==1
+    state={n['key']:n for n in client.get('/api/state').json['nodes']}
+    assert state['10.1.1.1']['details']['d42_ip_id']=='1'
+    assert state['10.1.1.2']['details']['d42_ip_status']=='ambiguous'
+    assert state['192.0.2.2']['details']['d42_ip_id']=='other'
+    assert len(calls)==2
     with m.connect() as db:
-        assert db.execute('SELECT COUNT(*) FROM d42_ip_runs').fetchone()[0] == 0
-        assert db.execute('SELECT COUNT(*) FROM d42_ip_candidates').fetchone()[0] == 0
-    nodes = {n['key']: n for n in client.get('/api/state').json['nodes']}
-    assert nodes['10.1.1.1']['details']['d42_ip_id'] == '1'
-    assert nodes['10.1.1.2']['details']['d42_ip_status'] == 'ambiguous'
-    assert not nodes['10.1.1.3']['d42_url']
-    assert calls == [{'limit': 2, 'offset': 0}, {'limit': 2, 'offset': 2}]
+        assert db.execute('SELECT COUNT(*) FROM d42_ip_runs').fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM d42_ip_targets').fetchone()[0]==0
+        assert db.execute('SELECT COUNT(*) FROM d42_ip_candidates').fetchone()[0]==0
+
+
+def test_targeted_lookup_rejects_extra_records_and_preserves_data(client, monkeypatch):
+    with m.connect() as db:
+        a=m.node(db,'ip','203.0.113.3',details={'d42_ip_id':'old'})
+        b=m.node(db,'ip','10.10.10.1')
+        m.edge(db,a,b,'nat_to','nat_csv')
+    monkeypatch.setattr(m,'d42_nat_ip_query',
+                        lambda creds, ips: [{'ip_address':'8.8.8.8','ipaddress_pk':55}])
+    r=client.post('/api/d42/ip_links/page',json={'username':'a','password':'b'})
+    assert r.status_code==502
+    assert 'outside the requested' in r.json['error']
+    state={n['key']:n for n in client.get('/api/state').json['nodes']}
+    assert state['203.0.113.3']['details']['d42_ip_id']=='old'
+    monkeypatch.setattr(m,'d42_nat_ip_query',lambda creds,ips: [])
+    r=client.post('/api/d42/ip_links/page',json={'username':'a','password':'b'})
+    assert r.status_code==200
+    assert r.json['no_matches_preserved'] is True
+    state={n['key']:n for n in client.get('/api/state').json['nodes']}
+    assert state['203.0.113.3']['details']['d42_ip_id']=='old'
+
+
+def test_doql_post_sends_only_known_ip_addresses(client,monkeypatch):
+    monkeypatch.setattr(m,'D42_URL','https://d42.example')
+    sent=[]
+    class Response:
+        status_code=200
+        def json(self):
+            return {'data':[{'ip_address':'10.0.0.1','ipaddress_pk':1}]}
+    def fake_post(url,**kwargs):
+        sent.append((url,kwargs))
+        return Response()
+    monkeypatch.setattr(m.requests,'post',fake_post)
+    data=m.d42_nat_ip_query(('analyst','secret'),['10.0.0.1'])
+    assert data==[{'ip_address':'10.0.0.1','ipaddress_pk':1}]
+    assert sent[0][0]=='https://d42.example/services/data/v1.0/query/'
+    assert 'WHERE ip_address IN (\'10.0.0.1\')' in sent[0][1]['data']['query']
+    assert sent[0][1]['data']['output_type']=='json'
+    assert sent[0][1]['auth']==('analyst','secret')
 
 
 def test_devices_import_one_page_per_request(client, monkeypatch):
@@ -316,7 +331,11 @@ def test_devices_import_one_page_per_request(client, monkeypatch):
 def test_page_import_reports_device42_timeout(client, monkeypatch):
     def failed_get(*args, **kwargs):
         raise m.requests.Timeout('Device42 timed out')
-    monkeypatch.setattr(m, 'd42_get', failed_get)
+    monkeypatch.setattr(m, 'd42_nat_ip_query', failed_get)
+    with m.connect() as db:
+        a=m.node(db,'ip','203.0.113.1')
+        b=m.node(db,'ip','10.0.0.1')
+        m.edge(db,a,b,'nat_to','d42_nat')
     r = client.post('/api/d42/ip_links/page',
                     json={'username': 'u', 'password': 'p'})
     assert r.status_code == 504
