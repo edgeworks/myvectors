@@ -31,6 +31,7 @@ aside{min-height:0;overflow-y:auto;overscroll-behavior:contain}
 *::-webkit-scrollbar-corner{background:#141e30}
 @media(max-width:900px){main{padding:12px}.workarea{display:flex;flex-direction:column}#display{flex:1 1 65%;min-height:0}aside{flex:1 1 35%;min-height:0;border-left:0;border-top:1px solid var(--border)}.toolbar{gap:7px}.toolbar input{min-width:120px}}
 @media(max-height:700px){header{padding:10px 20px}.stat{padding:6px 12px}.stat b{font-size:20px}.toolbar{padding:9px}.nav{margin-bottom:8px}main{padding:10px 16px}}
+td.mapped{max-width:225px;min-width:135px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}td.mapped.bad{color:#f5c18a}
 </style></head>
 <body>
 <header><div class="logo">◇ MyVectors <small>External exposure & dependency mapping</small></div><div class="subtle">Manual imports only · Local inventory</div></header>
@@ -134,13 +135,53 @@ try{let d=await api('/api/nodes/delete',{method:'POST',headers:{'Content-Type':'
 function clearSelection(){selectedIds.clear();updateDeleteButton()}
 function showDetails(){let a=$('#inspector');a.replaceChildren();let h=el('strong',selected?'Object details':'Details');a.append(h);let n=dataset.nodes.find(n=>n.id===selected);if(!n){a.append(el('p','Select a row or node to inspect its relationships.','subtle'));return}
 for(let [name,value] of [['Type',n.kind],['Name',n.label],['Connections',relations(n.id).length],['Last imported/edited',n.updated]]){let d=el('div','','kv');d.append(el('span',name),el('span',String(value)));a.append(d)}
-for(let [name,value] of Object.entries(n.details)){if(!value)continue;let d=el('div','','kv');d.append(el('span',name.replaceAll('_',' ')),el('span',String(value)));a.append(d)}
+for(let [name,value] of Object.entries(n.details)){
+  if(name==='d42_devices'||name==='d42_device_status')continue;
+  if(!value)continue;let d=el('div','','kv');d.append(el('span',name.replaceAll('_',' ')),el('span',String(value)));a.append(d)}
+if(n.kind==='ip' && n.details.d42_device_status){
+  let status=n.details.d42_device_status,dev=n.details.d42_devices||[];
+  let h=el('strong','Device42 device associations');h.style.display='block';h.style.marginTop='16px';a.append(h);
+  let statusText={single:'One device candidate (not yet verified for Octosam)',
+    multiple:'Multiple device candidates — review before using in Octosam',
+    cluster:'Device42 classifies this entry as a cluster — review its members',
+    ambiguous_ip:'IP overlaps multiple Device42 IP records (e.g. VRFs) — review',
+    unassigned:'IP found in Device42, but no device associated',
+    ip_not_found:'IP not found in Device42'}[status]||status;
+  a.append(el('p',statusText,'hint'));
+  for(const item of dev){
+    let wrapper=el('div','','kv');let label=el('span',item.name);
+    if(item.type)label.append(el('span',' · '+item.type,'subtle'));
+    wrapper.append(label);
+    if(item.url){let link=el('a','Device42');link.href=item.url;link.target='_blank';
+      link.rel='noopener noreferrer';wrapper.append(link)}
+    else wrapper.append(el('span','ID '+item.id));
+    a.append(wrapper);
+  }
+  if(dev.length)a.append(el('p','These are Device42 associations, not automatically validated server identities.','hint'));
+}
 if(n.d42_url){let aLink=el('a','Open in Device42');aLink.href=n.d42_url;aLink.target='_blank';aLink.rel='noopener noreferrer';a.append(aLink)}
 let b=el('button','Focus this node');b.style.display='block';b.style.marginTop='20px';b.onclick=()=>{focus=n.id;view='graph';updateSwitch();render()};a.append(b);let rm=el('button','Remove this object','danger');rm.style.marginTop='10px';rm.onclick=()=>removeObjects([n.id]);a.append(rm);a.append(el('p',`Relationships: ${relations(n.id).map(e=>e.relation.replaceAll('_',' ')).join(', ')||'none'}`,'hint'))}
 function renderTable(){let target=$('#tableview');target.replaceChildren();let nodes=filtered();updateDeleteButton();if(!nodes.length){target.append(el('div','No objects match this search. Import data or add a relationship.','empty'));return}
 let tbl=el('table'),head=el('thead'),row=el('tr');let hc=el('th','','check');let all=el('input');all.type='checkbox';all.setAttribute('aria-label','Select all visible objects');all.checked=nodes.every(n=>selectedIds.has(n.id));all.indeterminate=!all.checked&&nodes.some(n=>selectedIds.has(n.id));all.onchange=()=>{for(let n of nodes){if(all.checked)selectedIds.add(n.id);else selectedIds.delete(n.id)}renderTable()};hc.append(all);row.append(hc);
-for(let label of ['Type','Name / address','Links','Device42','Action'])row.append(el('th',label));head.append(row);tbl.append(head);let body=el('tbody');for(let n of nodes){let tr=el('tr');tr.onclick=()=>{selected=n.id;showDetails()};let checkCell=el('td','','check');let check=el('input');check.type='checkbox';check.checked=selectedIds.has(n.id);check.setAttribute('aria-label','Select '+n.label);check.onchange=()=>{if(check.checked)selectedIds.add(n.id);else selectedIds.delete(n.id);renderTable()};check.onclick=ev=>ev.stopPropagation();checkCell.append(check);tr.append(checkCell);
-let c=el('td');c.append(el('span',n.kind,'pill '+n.kind));tr.append(c);tr.append(el('td',n.label));tr.append(el('td',String(relations(n.id).length)));let l=el('td','','link');if(n.d42_url){let a=el('a','Open');a.href=n.d42_url;a.target='_blank';a.rel='noopener noreferrer';a.onclick=ev=>ev.stopPropagation();l.append(a)}else l.textContent='—';tr.append(l);let action=el('td');let btn=el('button','Focus');btn.onclick=ev=>{ev.stopPropagation();selected=n.id;focus=n.id;view='graph';updateSwitch();render()};action.append(btn);let del=el('button','Remove','danger');del.style.marginLeft='6px';del.onclick=ev=>{ev.stopPropagation();removeObjects([n.id])};action.append(del);tr.append(action);body.append(tr)}tbl.append(body);target.append(tbl)}
+for(let label of ['Type','Name / address','Links','Mapped device','Device42','Action'])row.append(el('th',label));head.append(row);tbl.append(head);let body=el('tbody');for(let n of nodes){let tr=el('tr');tr.onclick=()=>{selected=n.id;showDetails()};let checkCell=el('td','','check');let check=el('input');check.type='checkbox';check.checked=selectedIds.has(n.id);check.setAttribute('aria-label','Select '+n.label);check.onchange=()=>{if(check.checked)selectedIds.add(n.id);else selectedIds.delete(n.id);renderTable()};check.onclick=ev=>ev.stopPropagation();checkCell.append(check);tr.append(checkCell);
+let c=el('td');c.append(el('span',n.kind,'pill '+n.kind));tr.append(c);tr.append(el('td',n.label));tr.append(el('td',String(relations(n.id).length)));
+let mapped=el('td','','mapped');if(n.kind==='ip'){
+  const dev=n.details?.d42_devices||[],status=n.details?.d42_device_status||'';
+  const names=dev.map(d=>d.name+(d.type?' ('+d.type+')':''));
+  mapped.title=names.join(', ');
+  if(status==='multiple'||status==='ambiguous_ip'){
+    mapped.textContent=dev.length+' candidate'+(dev.length===1?'':'s')+' · review';
+    mapped.classList.add('bad');
+  }else if(status==='cluster'){
+    mapped.textContent=dev[0]?.name+' · cluster';
+    mapped.classList.add('bad');
+  }else if(status==='single')mapped.textContent=dev[0]?.name||'Unknown';
+  else if(status==='unassigned')mapped.textContent='Unassigned';
+  else if(status==='ip_not_found')mapped.textContent='No D42 IP';
+  else mapped.textContent='—';
+}else mapped.textContent='—';
+tr.append(mapped);
+let l=el('td','','link');if(n.d42_url){let a=el('a','Open');a.href=n.d42_url;a.target='_blank';a.rel='noopener noreferrer';a.onclick=ev=>ev.stopPropagation();l.append(a)}else l.textContent='—';tr.append(l);let action=el('td');let btn=el('button','Focus');btn.onclick=ev=>{ev.stopPropagation();selected=n.id;focus=n.id;view='graph';updateSwitch();render()};action.append(btn);let del=el('button','Remove','danger');del.style.marginLeft='6px';del.onclick=ev=>{ev.stopPropagation();removeObjects([n.id])};action.append(del);tr.append(action);body.append(tr)}tbl.append(body);target.append(tbl)}
 function graphNodes(){
   const filteredIds=new Set(filtered().map(n=>n.id));
   if(!focus)return dataset.nodes.filter(n=>filteredIds.has(n.id)).slice(0,65);
@@ -204,7 +245,7 @@ async function importD42(kind,button){
         $('#d42progress').textContent=progress;
         if(data.done){
           completed=true;
-          const result=kind==='ip_links'?(`Linked ${data.linked} NAT IPs · ambiguous ${data.ambiguous} · not found ${data.not_found}`+(data.no_matches_preserved?' · zero matches, previous links preserved':''))
+          const result=kind==='ip_links'?(`Linked ${data.linked} NAT IPs · device associations on ${data.with_device_candidates} · multiple devices on ${data.multiple_device_candidates} · unassigned ${data.unassigned_device} · ambiguous IP ${data.ambiguous}`+(data.no_matches_preserved?' · zero matches, previous mappings preserved':''))
             :(`Imported ${imported} device/IP relationships`);
           notify(label+' complete. '+result+' ('+pages+' pages)');
           await refresh();
